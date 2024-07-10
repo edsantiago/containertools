@@ -218,7 +218,26 @@ sub show_timings {
             $time = $marker->[0] . $time;
         }
 
-        $timings{$type}{$distro}{$user}{$db}{$host}{$remote} = [ $prefix, $time ];
+        # container will never be remote, will it?
+        $remote = 'container' if $host eq 'container';
+
+        # Abbreviate distro
+        if ($distro eq 'rawhide') {
+            $distro = 'raw';
+        }
+        elsif ($distro =~ /^fedora-(\d+)(-aarch64)?$/) {
+            $distro = "f$1";
+            $distro .= "-aa" if $2;
+        }
+        elsif ($distro =~ /^debian-(\d+)$/) {
+            $distro = "d$1";
+        }
+        else {
+            die "$ME: Unknown distro '$distro'";
+        }
+
+#        $timings{$type}{$distro}{$user}{$db}{$host}{$remote} = [ $prefix, $time ];
+        $timings{$type}{$user}{$remote}{$distro} = [ $prefix, $time ];
         $distros{$distro}++;
     }
 
@@ -242,44 +261,52 @@ sub show_timings {
 
     # Got results
     if ($Show_Headings) {
-        print "| type | distro              | user     | DB     |    local |   remote | container |\n";
-        print "| ---- | --------            | ----     | --     |    ----: |   -----: | --------: |\n";
+        my $h1 = "| type | user     |";
+        my $h2 = "| ---- | ----     |";
+
+        # Remote or container (FIXME: n/a for buildah)
+        if (1) {
+            $h1 .= " Rc |";
+            $h2 .= " -- |";
+        }
+        for my $distro (sort keys %distros) {
+            $h1 .= sprintf(" % 8s |", $distro);
+            $h2 .= sprintf(" %-8s |", "-" x 8);
+        }
+        print $h1, "\n", $h2, "\n";
+        #DB     |    local |   remote | container |\n";
+        #--     |    ----: |   -----: | --------: |\n";
     }
 
+    # Each ROW is: <test type> | <root|rootless> | <local|remote|container>
     for my $type (qw(int sys bud machine-linux)) {
-        for my $distro (reverse sort keys %distros) {
-            for my $who (qw(root rootless)) {
-                for my $db (qw(boltdb sqlite)) {
-                    my $t = $timings{$type}{$distro}{$who}{$db}
-                        or next;
+        for my $who (qw(root rootless)) {
+            for my $remote (qw(podman remote container)) {
+                my $t = $timings{$type}{$who}{$remote}
+                    or next;
 
-                    my $db_label = $db;
-                    $db_label = '' if $db eq 'sqlite';  # default
-                    printf "| %-4.4s | %-19s | %-8s | %-6s", $type, $distro, $who, $db_label;
+                # Abbreviate to make fit on terminal
+                my %rc = (podman => '', remote => 'R', container => ' c');
+                printf "| %-4.4s | %-8s | %-2s", $type, $who, $rc{$remote};
 
-                    # Helper function, basically printf " | %*s" that does
-                    # not include ANSI color sequences in the char count.
-                    my $p = sub {
-                        my ($len, $val) = @_;
-                        print " | ";
-                        if ($val) {
-                            printf "%s%*s",  $val->[0], $len, $val->[1];
-                            print  "\e[m" if $val->[0];
-                        }
-                        else {
-                            print " " x $len;
-                        }
-                    };
-
-                    for my $remote (qw(podman remote)) {
-                        $p->(8, $t->{host}{$remote});
+                # Helper function, basically printf " | %*s" that does
+                # not include ANSI color sequences in the char count.
+                my $p = sub {
+                    my ($len, $val) = @_;
+                    print " | ";
+                    if ($val) {
+                        printf "%s%*s",  $val->[0], $len, $val->[1];
+                        print  "\e[m" if $val->[0];
                     }
-                    # FIXME: container?
-                    if (exists $t->{container}) {
-                        $p->(9, $t->{container}{podman});
+                    else {
+                        print " " x $len;
                     }
-                    print " |\n";
+                };
+
+                for my $distro (sort keys %distros) {
+                    $p->(8, $t->{$distro});
                 }
+                print " |\n";
             }
         }
     }
