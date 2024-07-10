@@ -1,0 +1,582 @@
+#!/usr/bin/perl
+#
+# cirrus-pr-timing - display how long cirrus tasks took (or are taking)
+#
+package LibPod::CirrusPRTiming;
+
+use v5.14;
+use utf8;
+use open qw( :encoding(UTF-8) :std );
+
+use strict;
+use warnings;
+
+(our $ME = $0) =~ s|.*/||;
+(our $VERSION = '$Revision: 1.45 $ ') =~ tr/[0-9].//cd;
+
+use DBI;
+use JSON;
+use LWP::UserAgent;
+use Term::ANSIColor             qw(:constants);
+use Time::Piece;
+
+my $ua = new LWP::UserAgent();
+$ua->agent("$ME " . $ua->agent);              # Identify ourself
+
+###############################################################################
+# BEGIN user-customizable section
+
+our $API_URL = 'https://api.cirrus-ci.com/graphql';
+
+our $Log_URL = 'https://api.cirrus-ci.com/v1/task/%s/logs/%s.log';
+
+our $Query = <<'END_QUERY';
+{
+  "query": "query BuildByID($id: ID!) {
+    build(id: $id) {
+      id,status,buildCreatedTimestamp,durationInSeconds,clockDurationInSeconds,tasks {
+        id,name,labels,status,commands {
+          name,type,status
+        },notifications { level, message }, statusDurations {status durationInSeconds }
+      }
+    }
+  }",
+  "variables": {
+    "id": "%s"
+  }
+}
+END_QUERY
+
+# FIXME: add provisions for buildah, skopeo
+our $Project = 'podman';
+
+# Preserved PR ID, makes for friendlier dirs for --download
+our $PR;
+
+# By default, display table headings
+our $Show_Headings = 1;
+
+# Directory into which we save timing results
+our $Save_Dir = "$ENV{HOME}/.local/share/$ME";
+
+# END   user-customizable section
+###############################################################################
+
+###############################################################################
+# BEGIN boilerplate args checking, usage messages
+
+sub usage {
+    print  <<"END_USAGE";
+Usage: $ME [OPTIONS] CIRRUS-BUILD-ID or PR
+
+blah blah blah
+
+OPTIONS:
+
+  --noheadings     do not show headings. Useful with ci-watch script.
+  --download-logs  download all logs to a subdirectory
+  --links          display links to logs (plain logs, not formatted ones)
+  --launch FILTER  launch browser on tests that match FILTER (e.g. 'sys')
+  --project PROJ   container project (default: $Project)
+  --save           save query result into $Save_Dir
+
+  -v, --verbose  show verbose progress indicators
+  -n, --dry-run  make no actual changes
+
+  --help         display this message
+  --version      display program name and version
+END_USAGE
+
+    exit;
+}
+
+# Command-line options.  Note that this operates directly on @ARGV !
+our $download_logs = 0;
+our $show_log_links;
+our $launch  = '';
+our $Save;
+our $debug   = 0;
+our $force   = 0;
+our $verbose = 0;
+our $NOT     = '';              # print "blahing the blah$NOT\n" if $debug
+sub handle_opts {
+    use Getopt::Long;
+    GetOptions(
+        'noheadings'    => sub { $Show_Headings = 0 },
+        'download-logs' => \$download_logs,
+        'links'         => \$show_log_links,
+        'launch=s'      => \$launch,
+        'project=s'     => \$Project,
+        'save'          => \$Save,
+
+        'debug:i'    => \$debug,
+        'dry-run|n!' => sub { $NOT = ' [NOT]' },
+        'force'      => \$force,
+        'verbose|v'  => \$verbose,
+
+        help         => \&usage,
+        version      => sub { print "$ME version $VERSION\n"; exit 0 },
+    ) or die "Try `$ME --help' for help\n";
+}
+
+# END   boilerplate args checking, usage messages
+###############################################################################
+
+############################## CODE BEGINS HERE ###############################
+
+# The term is "modulino".
+__PACKAGE__->main()                                     unless caller();
+
+# Main code.
+sub main {
+    # Note that we operate directly on @ARGV, not on function parameters.
+    # This is deliberate: it's because Getopt::Long only operates on @ARGV
+    # and there's no clean way to make it use @_.
+    handle_opts();                      # will set package globals
+
+    # --launch FOO implies --links
+    $show_log_links = 1 if $launch;
+
+    # Fetch command-line arguments.  Barf if too many.
+    my $build_id = shift(@ARGV)
+        or die "$ME: missing BUILD_ID argument; try $ME --help\n";
+    die "$ME: Too many arguments; try $ME --help\n"                 if @ARGV;
+
+    # Might be called with a PR.
+    if ($build_id =~ /^(\d{4,5})$/) {
+        $PR = $1;
+        chomp(my $buildid_tmp = qx{get-cirrus-buildid-for-pr --project=$Project $PR});
+        $buildid_tmp =~ /^\d{7,}$/
+            or die "$ME: Did not get buildid (output is '$buildid_tmp')\n";
+        $build_id = $buildid_tmp;
+        # FIXME: preserve PR number, so we can use it in cross-reference
+    }
+
+    # FIXME: do code here
+    my @tasks = get_tasks($build_id);
+#    use Data::Dump; dd \@tasks; exit 0;
+
+    show_timings($build_id, @tasks);
+
+    show_log_links($build_id, @tasks)           if $show_log_links;
+    fetch_logs($build_id, @tasks)               if $download_logs;
+}
+
+
+sub show_timings {
+    my $build_id = shift;
+    my @alltasks = @_;
+
+    my %timings;
+    my %distros;
+
+    # Strip away restarted tasks (i.e. remove dups, keep only the newest)
+    my @tasks;
+    for (my $i = $#alltasks; $i >= 0; $i--) {
+        my $t = $alltasks[$i];
+        grep { $_->{name} eq $t->{name} } @tasks
+            or unshift @tasks, $t;
+    }
+
+    for my $t (sort { $a->{name} cmp $b->{name} } @tasks) {
+        my $name = $t->{name}
+            or die "No name for task!";
+
+        my $durations = $t->{statusDurations}
+            or do {
+                warn "$ME: No duration for task '$name'\n";
+                next;
+            };
+#        my @exec = grep { $_->{status} eq 'EXECUTING' || $_->{status} eq 'COMPLETED' } @$durations
+        my @exec = grep { $_->{status} eq 'EXECUTING' } @$durations
+            or next; # This is OK, task may not have run
+
+        # Convert seconds to MM:SS, and preserve in the record.
+        my $time = friendly_time($exec[0]{durationInSeconds});
+        $t->{__duration} = $time;
+
+        # From here on out, only interested in a subset of CI tests
+        next unless $name =~ /^(sys|int|bud|machine-linux) /;     # Only interesting ones
+        my ($type, $remote, $distro, $user, $host, $db) = split ' ', $name;
+        $db //= 'boltdb';
+
+        # Standout for certain statuses
+        my %highlight = (
+            COMPLETED => [ ' ', 32 ],
+            FAILED    => [ '!', 31 ],
+            EXECUTING => [ '*', 37 ],
+            SKIPPED   => [ '-', 33 ],
+            UNKNOWN   => [ '?', 33 ],
+        );
+        my $prefix = '';
+        my $marker = $highlight{$t->{status}} || $highlight{UNKNOWN};
+        if (-t *STDOUT) {
+            $prefix = "\e[" . $marker->[1] . "m";
+        }
+        else {
+            # Non-tty: single-character plain ASCII marker
+            $time = $marker->[0] . $time;
+        }
+
+        $timings{$type}{$distro}{$user}{$db}{$host}{$remote} = [ $prefix, $time ];
+        $distros{$distro}++;
+    }
+
+    # If we didn't find anything, check for failed precursor jobs
+    if (! keys(%timings)) {
+        if (my @failed = grep { $_->{status} eq 'FAILED' } @tasks) {
+            warn "$ME: No timing results for $PR. Failed jobs:\n";
+            warn "    $_->{name}\n"     for @failed;
+            exit 1;
+        }
+        elsif (my @executing = grep { $_->{status} eq 'EXECUTING' } @tasks) {
+            warn   "$ME: No timing results for $PR. Waiting for:\n";
+            printf STDERR "    %6s  %s\n", $_->{__duration}, $_->{name}
+                for @executing;
+        }
+        else {
+            warn "$ME: No results available yet, and no jobs executing\n";
+        }
+        exit 0;
+    }
+
+    # Got results
+    if ($Show_Headings) {
+        print "| type | distro              | user     | DB     |    local |   remote | container |\n";
+        print "| ---- | --------            | ----     | --     |    ----: |   -----: | --------: |\n";
+    }
+
+    for my $type (qw(int sys bud machine-linux)) {
+        for my $distro (reverse sort keys %distros) {
+            for my $who (qw(root rootless)) {
+                for my $db (qw(boltdb sqlite)) {
+                    my $t = $timings{$type}{$distro}{$who}{$db}
+                        or next;
+
+                    my $db_label = $db;
+                    $db_label = '' if $db eq 'sqlite';  # default
+                    printf "| %-4.4s | %-19s | %-8s | %-6s", $type, $distro, $who, $db_label;
+
+                    # Helper function, basically printf " | %*s" that does
+                    # not include ANSI color sequences in the char count.
+                    my $p = sub {
+                        my ($len, $val) = @_;
+                        print " | ";
+                        if ($val) {
+                            printf "%s%*s",  $val->[0], $len, $val->[1];
+                            print  "\e[m" if $val->[0];
+                        }
+                        else {
+                            print " " x $len;
+                        }
+                    };
+
+                    for my $remote (qw(podman remote)) {
+                        $p->(8, $t->{host}{$remote});
+                    }
+                    # FIXME: container?
+                    if (exists $t->{container}) {
+                        $p->(9, $t->{container}{podman});
+                    }
+                    print " |\n";
+                }
+            }
+        }
+    }
+}
+
+################
+#  fetch_logs  #  Download all sys & log files into a local subdirectory
+################
+sub fetch_logs {
+    my $build_id = shift;
+    my @tasks    = @_;
+
+    my $ua = new LWP::UserAgent();
+    $ua->agent("$ME " . $ua->agent);              # Identify ourself
+
+    my $destdir = "$ME.$build_id";
+    if ($PR) {
+        $destdir = sprintf("%s.%s.%s", $ME, $PR, localtime->strftime("%m%d-%H%M"));
+    }
+    mkdir $destdir, 0755
+        or die "$ME: Cannot mkdir $destdir: $!\n";
+    printf "Downloading into %s:\n", $destdir;
+
+    my $i = 1;
+    for my $t (sort { $a->{name} cmp $b->{name} } @tasks) {
+        (my $name = $t->{name}) =~ s/\s+/-/g;
+#        next unless $name =~ /^(sys|int)-/;
+
+        printf "%2d/%d %s...", $i++, scalar(@tasks), $name;
+
+        my $log_url = sprintf($Log_URL, $t->{id}, 'main');
+        my $res = $ua->get($log_url);
+        if ($res->code != 200) {
+            # FIXME: on 14608, we get *THREE* sys-remote-f36-rootless-host ???
+            print " ", RED, $res->code, RESET, "\n";
+            next;
+        }
+
+        # All OK
+        open my $fh_out, '>', "$destdir/$name"
+            or die "$ME: Cannot create $destdir/$name: $!\n";
+        print { $fh_out } $res->decoded_content;
+        close $fh_out
+            or die "$ME: Error writing $destdir/$name: $!\n";
+        print "\n";
+    }
+}
+
+
+####################
+#  show_log_links  #  Like the above, but show the links, don't download
+####################
+sub show_log_links {
+    my $build_id = shift;
+    my @tasks    = @_;
+
+    my %color = (
+        COMPLETED => GREEN,
+        CREATED   => BLACK,
+        EXECUTING => YELLOW,
+        FAILED    => RED,
+        SKIPPED   => YELLOW,
+    );
+
+    print "\n";
+    for my $t (sort { $a->{name} cmp $b->{name} } @tasks) {
+        next if $t->{status} eq 'ABORTED';
+
+        (my $name = $t->{name}) =~ s/\s+/-/g;
+        next unless $name =~ /^(sys|int|bud|netavark)-/i;
+
+        my $log_url = annotated_log($t)
+            || sprintf($Log_URL, $t->{id}, 'main');
+        printf "%-10s ", $t->{status}   if $debug;
+        my $c = $color{$t->{status}} || do {
+            warn "$ME: No color for '$t->{status}'\n";
+            '';
+        };
+        # %-43.43s chops some boldtb, but fits nicely on my terminal
+        printf "%s%-43.43s%s %s\n", $c, $name, RESET, $log_url;
+
+        system('browser-open', $log_url) if $launch && $name =~ /$launch/;
+    }
+}
+
+###################
+#  annotated_log  #  Return link to highlighted log
+###################
+sub annotated_log {
+    my $task = shift;
+
+    my $url_base          = "https://api.cirrus-ci.com";
+
+    # 2020-10 new Cirrus v2 with names like "sys podman fedora-31 root host"
+    (my $dashname = $task->{name}) =~ s/\s+/-/g;
+    # 2021-04-20 the compose and upgrade tests have a different name structure
+    $dashname =~ s/^(compose(_v2)?)-test-on-(\S+)-\((root(less)?)\)$/$1-podman-$3-$4-host/;
+    $dashname =~ s/^Upgrade-test:-from-[^-]+/upgrade_test-podman-$task->{image}-root-host/;
+
+    # 2022-02-10 Netavark also:
+    #     Netavark-sys-podman-root
+    #  -> sys-podman-fedora-35-root-host-netavark
+    $dashname =~ s/^Netavark-(\S+)-(\S+)-(\S+)/$1-$2-$task->{image}-$3-host-netavark/;
+#    printf "GOT HERE: dashname='$dashname'\n";
+    my $url = "${url_base}/v1/artifact/task/$task->{id}/html/$dashname.log.html";
+
+    my $res = $ua->head($url);
+    if ($res->code == 200) {
+        return $url;
+    }
+#    warn "$ME: Warning: No annotated log: $url\n";
+    return;
+}
+
+
+
+sub get_tasks {
+    my $build_id = shift;
+
+    my $query = sprintf($Query, $build_id);
+
+    my $res = $ua->post($API_URL, Content => $query);
+    if ((my $code = $res->code) != 200) {
+        printf "%s%03d%s", ($code < 400 ? YELLOW : RED), $code, RESET;
+        exit 1;
+    }
+
+    my $content = decode_json($res->content);
+    if ($content->{errors}) {
+        warn "$ME: Cirrus query failed\n";
+        print $query; use Data::Dump; dd $content;
+        exit 1;
+    }
+
+#    use Data::Dump; dd $content; exit 0;
+
+    exists $content->{data}
+        or die "$ME: No '{data}' section in response from Cirrus\n";
+    exists $content->{data}{build}
+        or die "$ME: No '{data}{build}' section in response from Cirrus\n";
+    exists $content->{data}{build}{tasks}
+        or die "$ME: No '{data}{build}{tasks}' section in response from Cirrus\n";
+
+    my @tasks;
+    for my $t (@{$content->{data}{build}{tasks}}) {
+        if ($t->{id}) {
+            push @tasks, $t;
+        }
+    }
+
+    # FIXME: side-channel kludge
+    if (my $seconds = $content->{data}{build}{clockDurationInSeconds}) {
+        printf ">> %s\n", friendly_time($seconds);
+    }
+
+    #    print DumpTree(\@tasks)     if $debug & 0x100;
+    use Data::Dump; dd \@tasks if $debug & 0x100;
+
+    if ($Save) {
+        my $outdir = sprintf("%s/%s/by-buildid/%02d", $Save_Dir, $Project, $build_id % 100);
+        mkdir $outdir, 0755     if ! -d $outdir;
+        my $outfile = sprintf("%s/%d.json", $outdir, $build_id);
+        my $tmpfile = "$outfile.tmp.$$";
+        open my $fh, '>', $tmpfile
+            or die "$ME: Cannot create $tmpfile: $!\n";
+        # FIXME: find some way to include the PR, so we can crossref
+        print { $fh } $res->content;
+        close $fh
+            or die "$ME: Error writing $tmpfile: $!\n";
+        chmod 0444 => $tmpfile;
+        unlink                         "$outfile.BAK";
+        rename             $outfile => "$outfile.BAK"  if -e $outfile;
+        rename $tmpfile => $outfile
+            or die "$ME: Could not rename $tmpfile: $!\n";
+
+        if ($PR) {
+            $outdir = sprintf("%s/%s/by-pr/%02d", $Save_Dir, $Project, $PR % 100);
+            mkdir $outdir, 0755     if ! -d $outdir;
+            $outfile = sprintf("%s/%d.txt", $outdir, $PR);
+            my $tmpfile = "$outfile.tmp.$$";
+            open my $fh, '>', $tmpfile
+                or die "$ME: Cannot create $tmpfile: $!\n";
+            # FIXME: preserve the buildId
+            for my $field (qw(buildCreatedTimestamp durationInSeconds clockDurationInSeconds)) {
+                printf { $fh } "%-50s  %24d\n", $field, $content->{data}{build}{$field};
+            }
+            for my $t (sort { $a->{name} cmp $b->{name} } grep { $_->{status} eq 'COMPLETED' } @tasks) {
+                my $durations = $t->{statusDurations}
+                    or die "$ME: No duration for task '$t->{name}'\n";
+                for my $d (grep { $_->{status} eq 'EXECUTING' } @$durations) {
+                    printf { $fh } " %-69s  %4d\n", $t->{name}, $d->{durationInSeconds};
+                }
+            }
+            close $fh
+                or die "$ME: Error writing $tmpfile: $!\n";
+            chmod 0444 => $tmpfile;
+            unlink                         "$outfile.BAK";
+            rename             $outfile => "$outfile.BAK"  if -e $outfile;
+            rename $tmpfile => $outfile
+                or die "$ME: Could not rename $tmpfile: $!\n";
+        }
+    }
+
+    return @tasks;
+}
+
+
+sub friendly_time {
+    my $t = shift;
+
+    my $s = sprintf("%02d", $t % 60);
+    while ($t > 60) {
+        $t /= 60;
+        $s = sprintf("%02d:%s", $t % 60, $s);
+    }
+
+    return $s;
+}
+
+
+1;
+
+__DATA__
+
+###############################################################################
+#
+# Documentation
+#
+
+=head1	NAME
+
+FIXME - description of what this script does
+
+=head1	SYNOPSIS
+
+FIXME [B<--foo>]  [B<--bar>]  [B<--verbose>] ARG1 [ARG2...] FIXME
+
+FIXME  B<--help>  |  B<--version> | B<--man>
+
+=head1	DESCRIPTION
+
+B<FIXME> grobbles the frobniz on alternate Tuesdays, except where
+prohibited by law.
+
+=head1	OPTIONS
+
+=over 4
+
+=item B<--foo>
+
+FIXME
+
+=item B<--verbose>
+
+Show progress messages.
+
+=item B<--help>
+
+Emit usage hints.
+
+=item B<--version>
+
+Display program version.
+
+=item B<--man>
+
+Display this man page.
+
+=back
+
+
+=head1	DIAGNOSTICS
+
+FIXME
+
+=head1	ENVIRONMENT
+
+FIXME
+
+=head1	FILES
+
+FIXME
+
+=head1	RESTRICTIONS
+
+FIXME
+
+=head1	SEE ALSO
+
+FIXME
+
+e.g. L<Foo::Bar|Foo::Bar>
+
+=head1	AUTHOR
+
+Your Name <ed@edsantiago.com>
+
+Please report bugs or suggestions to <ed@edsantiago.com>
+
+=cut

@@ -1,0 +1,327 @@
+#!/usr/bin/perl
+#
+# get-cirrus-taskid-for-pr
+#
+package ESM::GetCirrusTaskIDforPR;
+
+use v5.14;
+use utf8;
+use open qw( :encoding(UTF-8) :std );
+
+use strict;
+use warnings;
+
+(our $ME = $0) =~ s|.*/||;
+(our $VERSION = '$Revision: 1.11 $ ') =~ tr/[0-9].//cd;
+
+###############################################################################
+# BEGIN user-customizable section
+
+# Override via command line
+our $Project = 'podman';
+
+# github gives us a taskid, from that, cirrus gives us a buildid
+our @URLs = qw(
+                https://api.github.com/graphql
+                https://api.cirrus-ci.com/graphql
+          );
+
+# END   user-customizable section
+###############################################################################
+
+use JSON;
+use LWP::UserAgent;
+
+###############################################################################
+# BEGIN boilerplate args checking, usage messages
+
+sub usage {
+    print  <<"END_USAGE";
+Usage: $ME [OPTIONS] PR
+
+blah blah blah
+
+OPTIONS:
+
+  -v, --verbose  show verbose progress indicators
+  -n, --dry-run  make no actual changes
+
+  --help         display this message
+  --version      display program name and version
+END_USAGE
+
+    exit;
+}
+
+# Command-line options.  Note that this operates directly on @ARGV !
+our $debug   = 0;
+our $force   = 0;
+our $verbose = 0;
+our $NOT     = '';              # print "blahing the blah$NOT\n" if $debug
+sub handle_opts {
+    use Getopt::Long;
+    GetOptions(
+        'project=s'  => \$Project,
+        'buildah'    => sub { $Project = 'buildah' },
+        'skopeo'     => sub { $Project = 'skopeo' },
+
+        'debug!'     => \$debug,
+        'dry-run|n!' => sub { $NOT = ' [NOT]' },
+        'force'      => \$force,
+        'verbose|v'  => \$verbose,
+
+        help         => \&usage,
+        version      => sub { print "$ME version $VERSION\n"; exit 0 },
+    ) or die "Try `$ME --help' for help\n";
+}
+
+# END   boilerplate args checking, usage messages
+###############################################################################
+
+############################## CODE BEGINS HERE ###############################
+
+# The term is "modulino".
+__PACKAGE__->main()                                     unless caller();
+
+# Main code.
+sub main {
+    # Note that we operate directly on @ARGV, not on function parameters.
+    # This is deliberate: it's because Getopt::Long only operates on @ARGV
+    # and there's no clean way to make it use @_.
+    handle_opts();                      # will set package globals
+
+    # Fetch command-line arguments.  Barf if too many.
+    my $pr = shift(@ARGV)
+        or die "$ME: missing PR argument; try $ME --help\n";
+    die "$ME: Too many arguments; try $ME --help\n"                 if @ARGV;
+
+    doit($pr);
+}
+
+
+##########
+#  doit  #  Convert a PR to a Cirrus build ID
+##########
+sub doit {
+    my $pr = shift;
+
+    $pr =~ /^(\d{3,6})$/
+        or die "$ME: Invalid PR '$pr', must be 3-6 digits\n";
+
+    exists $ENV{GITHUB_TOKEN}
+        or die "$ME: \$GITHUB_TOKEN undefined\n";
+
+    my $task_id  = get_one_task_id($pr);
+    my $build_id = get_buildid_from_taskid($task_id);
+
+    print $build_id, "\n";
+}
+
+
+
+sub get_one_task_id {
+    my $pr = shift;
+
+    my $cirrus_app_id = 3232;           # FIXME-hardcoding
+
+    # Test that should always run on this repo.
+    my $checkName = 'Build Each Commit';
+    $checkName = 'Smoke Test'    if $Project eq 'buildah';
+    $checkName = 'Total Success' if $Project eq 'skopeo';
+    $checkName = 'Total success' if $Project eq 'netavark';
+
+    my $query = sprintf(<<'END_QUERY', $Project, $pr, $cirrus_app_id, $checkName);
+{
+  repository(owner:"containers", name: "%s") {
+    pullRequest(number: %d) {
+      commits(last: 1) {
+        edges {
+          node {
+            commit {
+              checkSuites(first: 1, filterBy: {appId: %d, checkName:"%s"}) {
+                nodes {
+                  checkRuns(first: 1) {
+                    nodes {
+                      name
+                      externalId
+                      status
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+END_QUERY
+
+    my $response = graphql_query('github', $query);
+#    use Data::Dump; dd $query, $response; exit 0;
+    my $task_id = $response->{data}{repository}{pullRequest}{commits}{edges}[0]{node}{commit}{checkSuites}{nodes}[0]{checkRuns}{nodes}[0]{externalId}
+        or die "$ME: Could not get task ID for '$checkName' on $Project PR $pr\n";
+}
+
+
+
+sub get_buildid_from_taskid {
+    my $task_id = shift;
+
+    my $query = sprintf(<<'END_QUERY', $task_id);
+{
+  task(id: %d) {
+    id, status, buildId
+  }
+}
+END_QUERY
+
+    my $response = graphql_query('cirrus', $query);
+    #    use Data::Dumper; print Dumper($response);
+    return $response->{data}{task}{buildId};
+}
+
+sub get_headref {
+    my $ua = shift;
+    my $pr = shift;
+
+    my $query = <<"END_QUERY";
+{
+    repository(owner:"containers",name:"$Project") {
+        pullRequest(number:$pr) {
+            id
+            headRefOid
+        }
+    }
+}
+END_QUERY
+
+    my $response = github_graphql($ua, $query);
+    return $response->{data}{repository}{pullRequest}{headRefOid};
+}
+
+
+###################
+#  graphql_query  #  Send a graphql query to host, return json response
+###################
+sub graphql_query {
+    my $host  = shift;                  # in: 'github' or 'cirrus'
+    my $query = shift;
+
+
+    my $ua = LWP::UserAgent->new;
+    $ua->agent("$ME " . $ua->agent);              # Identify ourself
+
+    # Find URL for host
+    my @match = grep { /$host/ } @URLs
+        or die "$ME: No match for '$host' in URLs\n";
+    @match == 1
+        or die "$ME: host '$host' is ambiguous\n";
+    my $url = $match[0];
+
+    my %headers = (
+        'Authorization' => "bearer $ENV{GITHUB_TOKEN}",
+        'Accept'        => "application/vnd.github.antiope-preview+json",
+        'Content-Type'  => "application/json",
+    );
+    if ($url =~ /github/) {
+        $ua->default_header($_ => $headers{$_}) for keys %headers;
+    }
+
+    # Escape quotes
+    $query =~ s/\"/\\"/g; $query =~ s/\n/ /g; $query =~ s/\s+/ /g;
+    my $postquery = qq/{ "query": "$query" }/;
+#    print $postquery; exit 0;
+
+    my $res = $ua->post($url, Content => $postquery);
+    if ((my $code = $res->code) != 200) {
+        use Term::ANSIColor qw(:constants);
+        printf "%s%03d%s", ($code < 400 ? YELLOW : RED), $code, RESET;
+        use Data::Dumper; print Dumper($res);
+        exit 1;
+    }
+
+    return decode_json($res->content);
+}
+
+1;
+
+__DATA__
+
+###############################################################################
+#
+# Documentation
+#
+
+=head1	NAME
+
+FIXME - description of what this script does
+
+=head1	SYNOPSIS
+
+FIXME [B<--foo>]  [B<--bar>]  [B<--verbose>] ARG1 [ARG2...] FIXME
+
+FIXME  B<--help>  |  B<--version> | B<--man>
+
+=head1	DESCRIPTION
+
+B<FIXME> grobbles the frobniz on alternate Tuesdays, except where
+prohibited by law.
+
+=head1	OPTIONS
+
+=over 4
+
+=item B<--foo>
+
+FIXME
+
+=item B<--verbose>
+
+Show progress messages.
+
+=item B<--help>
+
+Emit usage hints.
+
+=item B<--version>
+
+Display program version.
+
+=item B<--man>
+
+Display this man page.
+
+=back
+
+
+=head1	DIAGNOSTICS
+
+FIXME
+
+=head1	ENVIRONMENT
+
+FIXME
+
+=head1	FILES
+
+FIXME
+
+=head1	RESTRICTIONS
+
+FIXME
+
+=head1	SEE ALSO
+
+FIXME
+
+e.g. L<Foo::Bar|Foo::Bar>
+
+=head1	AUTHOR
+
+Your Name <ed@edsantiago.com>
+
+Please report bugs or suggestions to <ed@edsantiago.com>
+
+=cut

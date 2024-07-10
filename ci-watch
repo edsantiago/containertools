@@ -1,0 +1,40 @@
+#!/bin/bash
+#
+# ci-watch - run pr-timing against a list of PRs
+#
+# Requires github cli https://github.com/cli/cli
+#
+ME=$(basename $0)
+
+delay=60
+
+if [[ -z "$*" ]]; then
+    echo "Usage: $ME PR [PR...]" >&2
+    exit 1
+fi
+
+declare -A title
+for pr in "$@"; do
+    title[$pr]=$(gh pr view --json title --jq .title $pr)
+done
+
+function beep() {
+    echo -ne "\007"
+}
+
+while :;do
+    clear
+    nl=""
+    noheadings=
+    for pr in "$@";do
+        printf "%s\e[47;35;1m %s %s \e[m\n" "${nl}" "${pr}" "${title[$pr]}"
+        cirrus-pr-timing $noheadings $pr || beep
+
+        # For next iteration
+        nl="
+"
+        noheadings="--noheadings"
+    done
+
+    sleep $delay
+done
