@@ -4,7 +4,7 @@
 #
 package LibPod::CirrusPRTiming;
 
-use v5.14;
+use v5.20;
 use utf8;
 use open qw( :encoding(UTF-8) :std );
 
@@ -167,9 +167,6 @@ sub show_timings {
     my $build_id = shift;
     my @alltasks = @_;
 
-    my %timings;
-    my %distros;
-
     # Strip away restarted tasks (i.e. remove dups, keep only the newest)
     my @tasks;
     for (my $i = $#alltasks; $i >= 0; $i--) {
@@ -178,71 +175,10 @@ sub show_timings {
             or unshift @tasks, $t;
     }
 
-    for my $t (sort { $a->{name} cmp $b->{name} } @tasks) {
-        my $name = $t->{name}
-            or die "No name for task!";
-
-        my $durations = $t->{statusDurations}
-            or do {
-                warn "$ME: No duration for task '$name'\n";
-                next;
-            };
-#        my @exec = grep { $_->{status} eq 'EXECUTING' || $_->{status} eq 'COMPLETED' } @$durations
-        my @exec = grep { $_->{status} eq 'EXECUTING' } @$durations
-            or next; # This is OK, task may not have run
-
-        # Convert seconds to MM:SS, and preserve in the record.
-        my $time = friendly_time($exec[0]{durationInSeconds});
-        $t->{__duration} = $time;
-
-        # From here on out, only interested in a subset of CI tests
-        next unless $name =~ /^(sys|int|bud|machine-linux) /;     # Only interesting ones
-        my ($type, $remote, $distro, $user, $host, $db) = split ' ', $name;
-        $db //= 'boltdb';
-
-        # Standout for certain statuses
-        my %highlight = (
-            COMPLETED => [ ' ', 32 ],
-            FAILED    => [ '!', 31 ],
-            EXECUTING => [ '*', 37 ],
-            SKIPPED   => [ '-', 33 ],
-            UNKNOWN   => [ '?', 33 ],
-        );
-        my $prefix = '';
-        my $marker = $highlight{$t->{status}} || $highlight{UNKNOWN};
-        if (-t *STDOUT) {
-            $prefix = "\e[" . $marker->[1] . "m";
-        }
-        else {
-            # Non-tty: single-character plain ASCII marker
-            $time = $marker->[0] . $time;
-        }
-
-        # container will never be remote, will it?
-        $remote = 'container' if $host eq 'container';
-
-        # Abbreviate distro
-        if ($distro eq 'rawhide') {
-            $distro = 'raw';
-        }
-        elsif ($distro =~ /^fedora-(\d+)(-aarch64)?$/) {
-            $distro = "f$1";
-            $distro .= "-aa" if $2;
-        }
-        elsif ($distro =~ /^debian-(\d+)$/) {
-            $distro = "d$1";
-        }
-        else {
-            die "$ME: Unknown distro '$distro'";
-        }
-
-#        $timings{$type}{$distro}{$user}{$db}{$host}{$remote} = [ $prefix, $time ];
-        $timings{$type}{$user}{$remote}{$distro} = [ $prefix, $time ];
-        $distros{$distro}++;
-    }
+    my $timings = parse_timings(@tasks);
 
     # If we didn't find anything, check for failed precursor jobs
-    if (! keys(%timings)) {
+    if (! $timings->{_foo}) {
         if (my @failed = grep { $_->{status} eq 'FAILED' } @tasks) {
             warn "$ME: No timing results for $PR. Failed jobs:\n";
             warn "    $_->{name}\n"     for @failed;
@@ -260,56 +196,188 @@ sub show_timings {
     }
 
     # Got results
+    my @keys = @{$timings->{keys}};
+    my @distros = sort keys %{$timings->{distros}};
     if ($Show_Headings) {
-        my $h1 = "| type | user     |";
-        my $h2 = "| ---- | ----     |";
-
-        # Remote or container (FIXME: n/a for buildah)
-        if (1) {
-            $h1 .= " Rc |";
-            $h2 .= " -- |";
+        my $h1 = "|";
+        my $h2 = "|";
+        for my $k (@keys) {
+            $h1 .= sprintf(" %-*s |", $k->[1], $k->[0]);
+            $h2 .= sprintf(" %-*s |", $k->[1], "-" x $k->[1]);
         }
-        for my $distro (sort keys %distros) {
+
+        for my $distro (@distros) {
             $h1 .= sprintf(" % 8s |", $distro);
             $h2 .= sprintf(" %-8s |", "-" x 8);
         }
         print $h1, "\n", $h2, "\n";
-        #DB     |    local |   remote | container |\n";
-        #--     |    ----: |   -----: | --------: |\n";
     }
+
+    # Helper function: displays one timing cell
+    my $p = sub {
+        my ($len, $val) = @_;
+        print " ";
+        if ($val) {
+            printf "%s%*s",  $val->[0], $len, $val->[1];
+            print  "\e[m" if $val->[0];
+        }
+        else {
+            print " " x $len;
+        }
+        print " |";
+    };
 
     # Each ROW is: <test type> | <root|rootless> | <local|remote|container>
-    for my $type (qw(int sys bud machine-linux)) {
-        for my $who (qw(root rootless)) {
-            for my $remote (qw(podman remote container)) {
-                my $t = $timings{$type}{$who}{$remote}
-                    or next;
+    my $foo = sub {
+        my $row = shift;
+        my $t   = shift;
+        my $k   = shift;
 
-                # Abbreviate to make fit on terminal
-                my %rc = (podman => '', remote => 'R', container => ' c');
-                printf "| %-4.4s | %-8s | %-2s", $type, $who, $rc{$remote};
+        return if ! $t;
 
+        my ($name, $len, @fields) = @$k;
+
+      FIELD:
+        for my $field (@fields) {
+            next FIELD  if ! $t->{$field};
+
+            my $lhs = sprintf("%s %-*.*s |", $row, $len, $len, $field);
+
+            if (@_) {
+                # Recurse
+                __SUB__->( $lhs, $t->{$field}, @_ );
+            }
+            else {
+                # FIXME
+                print $lhs;
+#                use Data::Dump; dd $t;
                 # Helper function, basically printf " | %*s" that does
                 # not include ANSI color sequences in the char count.
-                my $p = sub {
-                    my ($len, $val) = @_;
-                    print " | ";
-                    if ($val) {
-                        printf "%s%*s",  $val->[0], $len, $val->[1];
-                        print  "\e[m" if $val->[0];
-                    }
-                    else {
-                        print " " x $len;
-                    }
-                };
-
-                for my $distro (sort keys %distros) {
-                    $p->(8, $t->{$distro});
+                for my $distro (@distros) {
+                    $p->(8, $t->{$field}{$distro});
                 }
-                print " |\n";
+                print "\n";
             }
         }
+    };
+
+    $foo->( '|', $timings->{_foo}, @keys);
+}
+
+
+sub parse_timings {
+    my @tasks = @_;                     # in: list of tasks
+    my $timings;                        # out: all timing info
+
+    my %distros;
+
+    # Standout for certain statuses
+    my %highlight = (
+        COMPLETED => [ ' ', 32 ],
+        FAILED    => [ '!', 31 ],
+        EXECUTING => [ '*', 37 ],
+        SKIPPED   => [ '-', 33 ],
+        UNKNOWN   => [ '?', 33 ],
+    );
+
+  TASK:
+    for my $t (sort { $a->{name} cmp $b->{name} } @tasks) {
+        my $name = $t->{name}
+            or die "No name for task!";
+
+        my $durations = $t->{statusDurations}
+            or do {
+                warn "$ME: No duration for task '$name'\n";
+                next;
+            };
+        my @exec = grep { $_->{status} eq 'EXECUTING' } @$durations
+            or next TASK; # This is OK, task may not have run
+
+        # Convert seconds to MM:SS, and preserve in the record.
+        my $time = friendly_time($exec[0]{durationInSeconds});
+        $t->{__duration} = $time;
+
+        my $prefix = '';
+        my $marker = $highlight{$t->{status}} || $highlight{UNKNOWN};
+        if (-t *STDOUT) {
+            $prefix = "\e[" . $marker->[1] . "m";
+        }
+        else {
+            # Non-tty: single-character plain ASCII marker
+            $time = $marker->[0] . $time;
+        }
+
+        # The rest of this is project-specific
+        #
+        # From here on out, only interested in a subset of CI tests
+        if ($Project eq 'podman') {
+            $timings->{keys} = [
+                [ "type", 4, "int", "sys", "bud", "machine-linux" ],
+                [ "user", 8, "root", "rootless" ],
+                [ "Rc",   2, "", "R ", " c" ],
+            ];
+
+            next unless $name =~ /^(sys|int|bud|machine-linux) /;     # Only interesting ones
+            my ($type, $remote, $distro, $user, $host, $db) = split ' ', $name;
+            $db //= 'sqlite';
+
+            # container will never be remote, will it?
+            $remote = 'container' if $host eq 'container';
+            my %rc = (podman => '', remote => 'R ', container => ' c');
+            $remote = $rc{$remote};
+
+            # Abbreviate distro
+            if ($distro eq 'rawhide') {
+                $distro = 'raw';
+            }
+            elsif ($distro =~ /^fedora-(\d+)(-aarch64)?$/) {
+                $distro = "f$1";
+                $distro .= "-aa" if $2;
+            }
+            elsif ($distro =~ /^debian-(\d+)$/) {
+                $distro = "d$1";
+            }
+            else {
+                die "$ME: Unknown distro '$distro'";
+            }
+
+            $timings->{_foo}{$type}{$user}{$remote}{$distro} = [ $prefix, $time ];
+            $timings->{distros}{$distro}++;
+        }
+        elsif ($Project eq 'buildah') {
+            $timings->{keys} = [
+                [ "type", 11, "Unit", "Conformance", "Integration" ],
+                [ "user",  8, "root", "rootless" ],
+                [ "fs",    7, "vfs",  "overlay" ],
+            ];
+
+            $name =~ /(Integration|Conformance|Unit)/
+                or next;
+            my $type = $1;
+
+            my $user = 'root';
+            $user = 'rootless' if $name =~ /rootless/;
+
+            my $fs = 'vfs';
+            if ($name =~ m!w/\s*(overlay|vfs)!) {
+                $fs = $1;
+            }
+
+            my $distro = 'f39';         # FIXME
+            if ($name =~ /(fedora|debian)-(\d+)/) {
+                $distro = substr($1, 0, 1) . $2;
+            }
+            elsif ($name =~ /Debian/) {
+                $distro = 'd13';        # FIXME
+            }
+
+            $timings->{_foo}{$type}{$user}{$fs}{$distro} = [ $prefix, $time ];
+            $timings->{distros}{$distro}++;
+        }
     }
+
+#    use Data::Dump; dd $timings;
+    return $timings;
 }
 
 ################
