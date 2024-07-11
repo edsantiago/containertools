@@ -21,5 +21,12 @@ This will run forever, clearing screen and displaying timing:
 | mach | rootless |    |          |          |    18:18 |          |          |
 ```
 
+If you have multiple PRs in flight, feed it all the PR numbers.
+
 `ci-watch` calls `cirrus-pr-timing`. You may find it useful to call
 that script too.
+
+NOTE
+====
+You will need a `$GITHUB_TOKEN`. Getting that and setting it
+(securely) in your environment is left as an exercise for the reader.
