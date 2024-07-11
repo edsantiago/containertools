@@ -213,8 +213,9 @@ sub show_timings {
         print $h1, "\n", $h2, "\n";
     }
 
-    # Helper function: displays one timing cell
-    my $p = sub {
+    # Helper function, basically printf " %*s |" that does
+    # not include ANSI color sequences in the char count.
+    my $print_timing_cell = sub {
         my ($len, $val) = @_;
         print " ";
         if ($val) {
@@ -228,7 +229,7 @@ sub show_timings {
     };
 
     # Each ROW is: <test type> | <root|rootless> | <local|remote|container>
-    my $foo = sub {
+    my $print_rows = sub {
         my $row = shift;
         my $t   = shift;
         my $k   = shift;
@@ -244,24 +245,22 @@ sub show_timings {
             my $lhs = sprintf("%s %-*.*s |", $row, $len, $len, $field);
 
             if (@_) {
-                # Recurse
+                # More non-distro fields to go
                 __SUB__->( $lhs, $t->{$field}, @_ );
             }
             else {
-                # FIXME
+                # We're down to the distro list, and we have results.
                 print $lhs;
-#                use Data::Dump; dd $t;
-                # Helper function, basically printf " | %*s" that does
-                # not include ANSI color sequences in the char count.
+
                 for my $distro (@distros) {
-                    $p->(8, $t->{$field}{$distro});
+                    $print_timing_cell->(8, $t->{$field}{$distro});
                 }
                 print "\n";
             }
         }
     };
 
-    $foo->( '|', $timings->{results}, @keys);
+    $print_rows->( '|', $timings->{results}, @keys);
 }
 
 
