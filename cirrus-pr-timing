@@ -178,7 +178,7 @@ sub show_timings {
     my $timings = parse_timings(@tasks);
 
     # If we didn't find anything, check for failed precursor jobs
-    if (! $timings->{_foo}) {
+    if (! $timings->{results}) {
         if (my @failed = grep { $_->{status} eq 'FAILED' } @tasks) {
             warn "$ME: No timing results for $PR. Failed jobs:\n";
             warn "    $_->{name}\n"     for @failed;
@@ -196,8 +196,8 @@ sub show_timings {
     }
 
     # Got results
-    my @keys = @{$timings->{keys}};
-    my @distros = sort keys %{$timings->{distros}};
+    my @keys = @{$timings->{matrix}};
+    my @distros = @{$timings->{distros}};
     if ($Show_Headings) {
         my $h1 = "|";
         my $h2 = "|";
@@ -261,13 +261,21 @@ sub show_timings {
         }
     };
 
-    $foo->( '|', $timings->{_foo}, @keys);
+    $foo->( '|', $timings->{results}, @keys);
 }
 
 
+###################
+#  parse_timings  #  Given a list of tasks, returns a parsed hash with timing info
+###################
+#
+# The complicated part is that we handle podman and buildah (and maybe others,
+# some day). Since everyone's test matrix is different, we need to return
+# a 'keys' hash which defines the elements (int/sys/bud vs Unit/Conformance etc).
+#
 sub parse_timings {
     my @tasks = @_;                     # in: list of tasks
-    my $timings;                        # out: all timing info
+    my $timings = {};                   # out: all timing info
 
     my %distros;
 
@@ -280,6 +288,28 @@ sub parse_timings {
         UNKNOWN   => [ '?', 33 ],
     );
 
+    my %matrix = (
+        podman => [
+            [ "type", 4, "int", "sys", "bud", "machine-linux" ],
+            [ "user", 8, "root", "rootless" ],
+            [ "Rc",   2, "", "R ", " c" ],
+        ],
+        buildah => [
+            [ "type", 11, "Unit", "Conformance", "Integration" ],
+            [ "user",  8, "root", "rootless" ],
+            [ "fs",    7, "vfs",  "overlay" ],
+        ],
+    );
+
+    # FIXME: how to handle unknown projects
+    $timings->{matrix} = $matrix{$Project}
+        or return;
+
+    # Main loop: find EXECUTING tasks[1], then find desired
+    # tests within those.
+    #
+    #  [1] "EXECUTING" also means "finished". Don't blame me.
+    #
   TASK:
     for my $t (sort { $a->{name} cmp $b->{name} } @tasks) {
         my $name = $t->{name}
@@ -307,16 +337,9 @@ sub parse_timings {
             $time = $marker->[0] . $time;
         }
 
-        # The rest of this is project-specific
-        #
-        # From here on out, only interested in a subset of CI tests
+        # The rest of this is project-specific. Each project has its
+        # own subset of tests that we're interested in.
         if ($Project eq 'podman') {
-            $timings->{keys} = [
-                [ "type", 4, "int", "sys", "bud", "machine-linux" ],
-                [ "user", 8, "root", "rootless" ],
-                [ "Rc",   2, "", "R ", " c" ],
-            ];
-
             next unless $name =~ /^(sys|int|bud|machine-linux) /;     # Only interesting ones
             my ($type, $remote, $distro, $user, $host, $db) = split ' ', $name;
             $db //= 'sqlite';
@@ -340,17 +363,11 @@ sub parse_timings {
             else {
                 die "$ME: Unknown distro '$distro'";
             }
+            $distros{$distro}++;
 
-            $timings->{_foo}{$type}{$user}{$remote}{$distro} = [ $prefix, $time ];
-            $timings->{distros}{$distro}++;
+            $timings->{results}{$type}{$user}{$remote}{$distro} = [ $prefix, $time ];
         }
         elsif ($Project eq 'buildah') {
-            $timings->{keys} = [
-                [ "type", 11, "Unit", "Conformance", "Integration" ],
-                [ "user",  8, "root", "rootless" ],
-                [ "fs",    7, "vfs",  "overlay" ],
-            ];
-
             $name =~ /(Integration|Conformance|Unit)/
                 or next;
             my $type = $1;
@@ -370,11 +387,13 @@ sub parse_timings {
             elsif ($name =~ /Debian/) {
                 $distro = 'd13';        # FIXME
             }
+            $distros{$distro}++;
 
-            $timings->{_foo}{$type}{$user}{$fs}{$distro} = [ $prefix, $time ];
-            $timings->{distros}{$distro}++;
+            $timings->{results}{$type}{$user}{$fs}{$distro} = [ $prefix, $time ];
         }
     }
+
+    $timings->{distros} = [ sort keys %distros ];
 
 #    use Data::Dump; dd $timings;
     return $timings;
