@@ -163,6 +163,9 @@ sub main {
 }
 
 
+##################
+#  show_timings  # Parse timings, then display them in friendly table
+##################
 sub show_timings {
     my $build_id = shift;
     my @alltasks = @_;
@@ -195,10 +198,12 @@ sub show_timings {
         exit 0;
     }
 
-    # Got results
+    # Got results.
     my @keys = @{$timings->{matrix}};
     my @distros = @{$timings->{distros}};
     if ($Show_Headings) {
+        # Two title lines showing the matrix element names, and distros, e.g.:
+        #    | type  | user  | fs | d13 | f38 | f39 |
         my $h1 = "|";
         my $h2 = "|";
         for my $k (@keys) {
@@ -245,7 +250,7 @@ sub show_timings {
             my $lhs = sprintf("%s %-*.*s |", $row, $len, $len, $field);
 
             if (@_) {
-                # More non-distro fields to go
+                # More non-distro fields to go: recurse one more level
                 __SUB__->( $lhs, $t->{$field}, @_ );
             }
             else {
