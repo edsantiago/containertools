@@ -30,3 +30,18 @@ NOTE
 ====
 You will need a `$GITHUB_TOKEN`. Getting that and setting it
 (securely) in your environment is left as an exercise for the reader.
+
+
+-------------------------
+
+```bash
+$ cirrus-get-cronjobs
+...
+podman  https://cirrus-ci.com/settings/repository/6707778565701632
+   v3.0.1-rhel          20 20 20 ? * 1-6     [ EXPECTED: 0 30 2 ? * 2 * ]
+   v1.6.4-rhel          19 19 19 ? * 1-6     [ EXPECTED: 0 0 4 ? * 1 * ]
+   v5.2                 18 18 18 ? * 1-6     [ EXPECTED: 0 0 13 ? * 3 * ]
+   main                 17 17 17 ? * 1-6     [ EXPECTED: 0 30 4 ? * 1-5 * ]
+   .....
+```
+Finding the spreadsheet is left as an exercise for the reader.

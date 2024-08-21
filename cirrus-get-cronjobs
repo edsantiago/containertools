@@ -1,0 +1,330 @@
+#!/usr/bin/perl
+#
+# cirrus-get-cronjobs - get container project cron jobs
+#
+package ESM::GetCirrusCronJobs;
+
+use v5.14;
+use utf8;
+use open qw( :encoding(UTF-8) :std );
+
+use strict;
+use warnings;
+use JSON;
+use LWP::UserAgent;
+
+(our $ME = $0) =~ s|.*/||;
+
+our $VERSION = '1.0';
+
+###############################################################################
+# BEGIN user-customizable section
+
+# Cirrus GraphQL
+our $URL = 'https://api.cirrus-ci.com/graphql';
+
+# Link for human to make changes. Code below appends repo ID
+our $UI_URL = 'https://cirrus-ci.com/settings/repository/';
+
+# File > Download > PDF
+#    Export           = Workbook (not Current sheet)
+#    Page orientation = Landscape
+#    Scale            = Fit to width
+#    Margins          = Normal
+#    Headers & footers
+#         [ ] Page numbers
+#         [X] Workbook title
+#         [X] Sheet name
+#         [X] Current date
+#         [X] Current time
+#
+our $Spreadsheet = "$ENV{HOME}/Downloads/Cirrus-Cron Calculator.pdf";
+
+# END   user-customizable section
+###############################################################################
+
+###############################################################################
+# BEGIN boilerplate args checking, usage messages
+
+sub usage {
+    print  <<"END_USAGE";
+Usage: $ME [OPTIONS] [PROJECT [...]]
+
+$ME cross-references Cirrus cron jobs (reality) against
+a spreadsheet listing desired ones (wishlist).
+
+PROJECT arg(s), if present, restrict output to only the
+given project(s).
+
+
+The spreadsheet is expected to be PDF and in your home dir:
+
+  $Spreadsheet
+
+PDF, not a real spreadsheet format, because (1) formulas are
+hard, and (2) it's real easy to read pdf. Unfortunately it's
+not so easy to generate. You need to:
+
+  File > Download > PDF
+
+...and make sure you export _Workbook_ (not "Current sheet")
+and select, under Headers & footers:
+
+   Work book title
+   Sheet name
+   Current date
+   Current time
+
+OPTIONS:
+
+  --help         display this message
+  --version      display program name and version
+END_USAGE
+
+    exit;
+}
+
+# Command-line options.  Note that this operates directly on @ARGV !
+our $debug   = 0;
+our $force   = 0;
+our $verbose = 0;
+our $NOT     = '';              # print "blahing the blah$NOT\n" if $debug
+sub handle_opts {
+    use Getopt::Long;
+    GetOptions(
+        'debug!'     => \$debug,
+        'dry-run|n!' => sub { $NOT = ' [NOT]' },
+        'force'      => \$force,
+        'verbose|v'  => \$verbose,
+
+        help         => \&usage,
+        version      => sub { print "$ME version $VERSION\n"; exit 0 },
+    ) or die "Try `$ME --help' for help\n";
+}
+
+# END   boilerplate args checking, usage messages
+###############################################################################
+
+############################## CODE BEGINS HERE ###############################
+
+# The term is "modulino".
+__PACKAGE__->main()                                     unless caller();
+
+# Main code.
+sub main {
+    # Note that we operate directly on @ARGV, not on function parameters.
+    # This is deliberate: it's because Getopt::Long only operates on @ARGV
+    # and there's no clean way to make it use @_.
+    handle_opts();                      # will set package globals
+
+    doit(@ARGV);
+}
+
+##########
+#  doit  #  Find all projects, show their Cirrus cron jobs
+##########
+sub doit {
+    # args, if present, restrict output to only the given projects
+    my %project_wanted = map { lc($_) => 1 } @_;
+
+    # Desired cron entries
+    my %want = read_spreadsheet();
+
+    my $separator = '';
+    for my $tuple (all_projects()) {
+        my ($projname, $repoid) = @$tuple;
+
+        if (keys(%project_wanted)) {
+            $project_wanted{___placeholder} = 1;
+            delete $project_wanted{$projname}
+                or next;
+        }
+
+        my $jobs_wanted = $want{$projname};
+
+        my @cronjobs = get_cronjobs($repoid);
+        if (@cronjobs) {
+            print $separator; $separator = "\n";
+
+            printf "%s  %s%s", $projname, $UI_URL, $repoid;
+            print "  -- not mentioned in spreadsheet" if ! $jobs_wanted;
+            print "\n";
+
+            for my $job (@cronjobs) {
+                my $branch = $job->{branch};
+                printf "   %-20s %-20s", $branch, $job->{expression};
+                my $name = $job->{name};
+                print  " (name = $name)" if $name ne $branch;
+                # FIXME: here is where we could crossref against spreadsheet
+                if ($jobs_wanted) {
+                    if (my $expect = $jobs_wanted->{$branch}) {
+                        if ($job->{expression} ne $expect) {
+                            print " [ DESIRED: $expect ]";
+                        }
+
+                        delete $jobs_wanted->{$branch};
+                    }
+                    else {
+                        print " [NOT IN SPREADSHEET]";
+                    }
+                }
+                print "\n";
+            }
+
+            if ($want{$projname}) {
+                if (my @leftover = sort keys %{$want{$projname}}) {
+                    printf "   %-20s %-20s    *** IN SPREADSHEET, NOT IRL\n", $_, $want{$projname}{$_}
+                        for @leftover;
+                }
+            }
+        }
+        elsif ($jobs_wanted) {
+            print "$projname -- mentioned in spreadsheet, but has no jobs!\n";
+        }
+    }
+
+    # Check for invalid command-line args
+    delete $project_wanted{___placeholder};
+    if (my @leftovers = sort keys %project_wanted) {
+        warn "$ME: invalid/unknown project '$_'\n" for @leftovers;
+        exit 1;
+    }
+}
+
+
+##################
+#  all_projects  #  Returns a list of [ <project name>, <cirrus repo id> ] tuples
+##################
+sub all_projects {
+    my $result = graphql_query( <<"END_QUERY" );
+query {
+  ownerInfoByName(platform:"github", name:"containers") {
+    repositories {
+      edges {
+        node {
+          id, name
+        }
+      }
+    }
+  }
+}
+END_QUERY
+
+    my $nodes = $result->{data}{ownerInfoByName}{repositories}{edges}
+        or do {
+            use Data::Dump; dd $result;
+            die "$ME: FATAL: did not find data->ownerInfoByName->repositories->edges";
+        };
+
+    my %repoid = map { $_->{node}{name} => $_->{node}{id} } @$nodes;
+
+    my @all = map { [ $_, $repoid{$_} ] } sort(keys(%repoid));
+    return @all;
+}
+
+
+##################
+#  get_cronjobs  #  Return list of cron jobs for a given repo
+##################
+sub get_cronjobs {
+    my $repoid = shift;
+
+    my $result = graphql_query( <<"END_QUERY" );
+query {
+  repository(id:"$repoid") {
+    cronSettings {
+      name, branch, expression
+    }
+  }
+}
+END_QUERY
+
+    my $jobs = $result->{data}{repository}{cronSettings}
+        or do {
+            use Data::Dump; dd $result;
+            die "$ME: FATAL: did not find data->repository->cronSettings";
+    };
+
+    return @$jobs;
+}
+
+
+###################
+#  graphql_query  #  Send a graphql query to host, return json response
+###################
+sub graphql_query {
+    my $query = shift;
+
+    my $ua = LWP::UserAgent->new;
+    $ua->agent("$ME " . $ua->agent);              # Identify ourself
+
+    my %headers = (
+##        'Authorization' => "bearer $ENV{GITHUB_TOKEN}",
+        'Accept'        => "application/vnd.github.antiope-preview+json",
+        'Content-Type'  => "application/json",
+    );
+    $ua->default_header($_ => $headers{$_}) for keys %headers;
+
+    # Escape quotes
+    $query =~ s/\"/\\"/g; $query =~ s/\n/ /g; $query =~ s/\s+/ /g;
+    my $postquery = qq/{ "query": "$query" }/;
+#    print $postquery; exit 0;
+
+    my $res = $ua->post($URL, Content => $postquery);
+    if ((my $code = $res->code) != 200) {
+        use Term::ANSIColor qw(:constants);
+        printf "%s%03d%s", ($code < 400 ? YELLOW : RED), $code, RESET;
+        use Data::Dumper; print Dumper($res);
+        exit 1;
+    }
+
+    return decode_json($res->content);
+}
+
+
+######################
+#  read_spreadsheet  #  returns { key=<project name>, value={ key=<branch>, value=<cron string> } }
+######################
+sub read_spreadsheet {
+    return unless -e $Spreadsheet;
+
+    my $project;
+    my %by_project;
+
+    open my $pdftotext, '-|', 'pdftotext', '-q', '-nopgbrk', '-layout', $Spreadsheet, '-'
+        or die "$ME: Could not fork: $!\n";
+    while (my $line = <$pdftotext>) {
+        $line =~ s/\s+$//;                      # trim trailing whitespace
+
+        if ($line =~ /^Cirrus-Cron Calculator\s{20,}(\S+)/) {
+            $project = lc($1);
+        }
+        elsif ($line =~ /^\s{10,}(\S+)\s{5,}[\d:]+\s{5,}\d+:\d+\s+(\d.*)/) {
+            my ($branch, $cron_entry) = ($1, $2);
+
+            if ($cron_entry =~ s/\s+(\d+-\d+-\d+)//) {
+                my $eol = $1;
+
+                # FIXME: warn about approaching or past EOL?
+            }
+
+            # FIXME: all the spreadsheet entries have a weird extra asterisk column, why????
+            $cron_entry =~ s/\s+\*$//;
+
+            defined $project
+                or die "$ME: cron entry but no project: $line";
+            if (exists $by_project{$branch}) {
+                die "$ME: duplicate entries for $project $branch: $line\n";
+            }
+            $by_project{$project}{$branch} = $cron_entry;
+        }
+    }
+    close $pdftotext
+        or die "$ME: Error running pdftotext on $Spreadsheet\n";
+
+    return %by_project;
+}
+
+
+
+1;
