@@ -305,8 +305,14 @@ sub read_spreadsheet {
 
             if ($cron_entry =~ s/\s+(\d+-\d+-\d+)//) {
                 my $eol = $1;
+                my $eol_t = str2time($eol);
 
-                # FIXME: warn about approaching or past EOL?
+                if ($eol_t < time) {
+                    warn "$ME: $project $branch: EOL date $eol is past!\n";
+                }
+                elsif (($eol_t - time) < 7 * 86400) {
+                    warn "$ME: $project $branch: EOL date $eol is coming up!\n";
+                }
             }
 
             # FIXME: all the spreadsheet entries have a weird extra asterisk column, why????
