@@ -129,6 +129,7 @@ sub get_one_task_id {
     $checkName = 'Smoke Test'    if $Project eq 'buildah';
     $checkName = 'Total Success' if $Project eq 'skopeo';
     $checkName = 'Total success' if $Project eq 'netavark';
+    $checkName = 'Total success' if $Project eq 'aardvark-dns';
 
     my $query = sprintf(<<'END_QUERY', $Project, $pr, $cirrus_app_id, $checkName);
 {
