@@ -143,7 +143,7 @@ sub main {
     die "$ME: Too many arguments; try $ME --help\n"                 if @ARGV;
 
     # Might be called with a PR.
-    if ($build_id =~ /^(\d{4,5})$/) {
+    if ($build_id =~ /^(\d{3,5})$/) {
         $PR = $1;
         chomp(my $buildid_tmp = qx{get-cirrus-buildid-for-pr --project=$Project $PR});
         $buildid_tmp =~ /^\d{7,}$/
@@ -307,7 +307,11 @@ sub parse_timings {
 
     # FIXME: how to handle unknown projects
     $timings->{matrix} = $matrix{$Project}
-        or return;
+        or do {
+            warn "$ME: No matrix for $Project\n";
+            use Data::Dump; dd \@tasks;
+            return;
+        };
 
     # Main loop: find EXECUTING tasks[1], then find desired
     # tests within those.
