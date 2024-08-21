@@ -13,6 +13,9 @@ if [[ -z "$*" ]]; then
     exit 1
 fi
 
+# For handling non-podman
+project=$(git remote -v|sed -ne 's;^.*containers/\([a-z]\+\).*$;\1;p'|head -n1)
+
 declare -A title
 for pr in "$@"; do
     title[$pr]=$(gh pr view --json title --jq .title $pr)
@@ -28,7 +31,7 @@ while :;do
     noheadings=
     for pr in "$@";do
         printf "%s\e[47;35;1m %s %s \e[m\n" "${nl}" "${pr}" "${title[$pr]}"
-        cirrus-pr-timing $noheadings $pr || beep
+        cirrus-pr-timing --project=$project $noheadings $pr || beep
 
         # For next iteration
         nl="
