@@ -12,6 +12,7 @@ use strict;
 use warnings;
 use JSON;
 use LWP::UserAgent;
+use Date::Parse;
 
 (our $ME = $0) =~ s|.*/||;
 
@@ -259,7 +260,6 @@ sub graphql_query {
     $ua->agent("$ME " . $ua->agent);              # Identify ourself
 
     my %headers = (
-##        'Authorization' => "bearer $ENV{GITHUB_TOKEN}",
         'Accept'        => "application/vnd.github.antiope-preview+json",
         'Content-Type'  => "application/json",
     );
@@ -290,6 +290,7 @@ sub read_spreadsheet {
 
     my $project;
     my %by_project;
+    my $warned_about_docdate = 0;
 
     open my $pdftotext, '-|', 'pdftotext', '-q', '-nopgbrk', '-layout', $Spreadsheet, '-'
         or die "$ME: Could not fork: $!\n";
@@ -318,6 +319,19 @@ sub read_spreadsheet {
             }
             $by_project{$project}{$branch} = $cron_entry;
         }
+
+        # Check for too-old document
+        elsif ($line =~ m!^\s*(\d+/\d+/\d{4})\s!) {
+            my $doc_date = $1;
+            my $doc_t = str2time($doc_date);
+            if (! $warned_about_docdate) {
+                if ((time - $doc_t) > 7 * 86400) {
+                    warn "$ME: WARNING: spreadsheet is more than two weeks old ($doc_date)\n";
+                    $warned_about_docdate = 1;
+                }
+            }
+        }
+
     }
     close $pdftotext
         or die "$ME: Error running pdftotext on $Spreadsheet\n";
