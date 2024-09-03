@@ -374,6 +374,9 @@ sub parse_timings {
             }
             $distros{$distro}++;
 
+            if (exists $timings->{results}{$type}{$user}{$remote}{$distro}) {
+                die "$ME: FATAL: already have results for $type | $user | $remote | $distro";
+            }
             $timings->{results}{$type}{$user}{$remote}{$distro} = [ $prefix, $time ];
         }
         elsif ($Project eq 'buildah') {
