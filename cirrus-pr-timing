@@ -364,6 +364,7 @@ sub parse_timings {
             elsif ($distro =~ /^fedora-(\d+)(-aarch64)?$/) {
                 $distro = "f$1";
                 $distro .= "-aa" if $2;
+                $distro .= "-b" if $name =~ /boltdb/;
             }
             elsif ($distro =~ /^debian-(\d+)$/) {
                 $distro = "d$1";
