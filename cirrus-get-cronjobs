@@ -39,7 +39,7 @@ our $UI_URL = 'https://cirrus-ci.com/settings/repository/';
 #         [X] Current date
 #         [X] Current time
 #
-our $Spreadsheet = "$ENV{HOME}/Downloads/Cirrus-Cron Calculator.pdf";
+our $Spreadsheet = "$ENV{HOME}/doc/rclone/Containers/Cirrus-Cron Calculator.xlsx";
 
 # END   user-customizable section
 ###############################################################################
@@ -286,22 +286,43 @@ sub graphql_query {
 #  read_spreadsheet  #  returns { key=<project name>, value={ key=<branch>, value=<cron string> } }
 ######################
 sub read_spreadsheet {
-    return unless -e $Spreadsheet;
+    -e $Spreadsheet
+        or die "$ME: File missing: $Spreadsheet\n";
 
-    my $project;
+    # Check for too-old document
+    my $age = int(-M $Spreadsheet);
+    warn "$ME: WARNING: spreadsheet is $age days old\n"
+        if $age > 14;
+
+    use Spreadsheet::ParseXLSX;
+
+    my $parser   = Spreadsheet::ParseXLSX->new();
+    my $workbook = $parser->parse($Spreadsheet);
+    defined $workbook
+        or die $parser->error(), "\n";
+
     my %by_project;
-    my $warned_about_docdate = 0;
 
-    open my $pdftotext, '-|', 'pdftotext', '-q', '-nopgbrk', '-layout', $Spreadsheet, '-'
-        or die "$ME: Could not fork: $!\n";
-    while (my $line = <$pdftotext>) {
-        $line =~ s/\s+$//;                      # trim trailing whitespace
+    for my $worksheet ( $workbook->worksheets() ) {
+        my $name = $worksheet->get_name();
+        next if $name =~ /Template/;
 
-        if ($line =~ /^Cirrus-Cron Calculator\s{20,}(\S+)/) {
-            $project = lc($1);
-        }
-        elsif ($line =~ /^\s{10,}(\S+)\s{5,}[\d:]+\s{5,}\d+:\d+\s+(\d.*)/) {
-            my ($branch, $cron_entry) = ($1, $2);
+        my $project = lc($name);
+
+        my ( $row_min, $row_max ) = $worksheet->row_range();
+        my ( $col_min, $col_max ) = $worksheet->col_range();
+
+      ROW:
+        for my $row ( 2 .. $row_max ) {
+            my $branch_ref = $worksheet->get_cell($row, 0)
+                or next ROW;
+            my $branch = $branch_ref->value()
+                or next ROW;
+            my $cron_entry_ref = $worksheet->get_cell($row, 3)
+                or next ROW;
+            my $cron_entry = $cron_entry_ref->value()
+                or next ROW;
+
 
             if ($cron_entry =~ s/\s+(\d+-\d+-\d+)//) {
                 my $eol = $1;
@@ -318,29 +339,13 @@ sub read_spreadsheet {
             # FIXME: all the spreadsheet entries have a weird extra asterisk column, why????
             $cron_entry =~ s/\s+\*$//;
 
-            defined $project
-                or die "$ME: cron entry but no project: $line";
-            if (exists $by_project{$branch}) {
-                die "$ME: duplicate entries for $project $branch: $line\n";
+            if (exists $by_project{$project}{$branch}) {
+                die "$ME: duplicate entries for $project $branch: replacing with $cron_entry\n";
             }
             $by_project{$project}{$branch} = $cron_entry;
         }
 
-        # Check for too-old document
-        elsif ($line =~ m!^\s*(\d+/\d+/\d{4})\s!) {
-            my $doc_date = $1;
-            my $doc_t = str2time($doc_date);
-            if (! $warned_about_docdate) {
-                if ((time - $doc_t) > 7 * 86400) {
-                    warn "$ME: WARNING: spreadsheet is more than two weeks old ($doc_date)\n";
-                    $warned_about_docdate = 1;
-                }
-            }
-        }
-
     }
-    close $pdftotext
-        or die "$ME: Error running pdftotext on $Spreadsheet\n";
 
     return %by_project;
 }
