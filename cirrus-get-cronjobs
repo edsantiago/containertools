@@ -246,7 +246,7 @@ END_QUERY
             die "$ME: FATAL: did not find data->repository->cronSettings";
     };
 
-    return @$jobs;
+    return sort { $a->{branch} cmp $b->{branch} } @$jobs;
 }
 
 
