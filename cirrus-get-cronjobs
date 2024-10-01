@@ -134,23 +134,27 @@ sub doit {
 
             for my $job (@cronjobs) {
                 my $branch = $job->{branch};
-                printf "   %-20s %-20s", $branch, $job->{expression};
+
+                # Don't print yet. Gather output into a string, so we can trim trailing whitespace.
+                my $outstring = sprintf("   %-20s %-20s", $branch, $job->{expression});
                 my $name = $job->{name};
-                print  " (name = $name)" if $name ne $branch;
+                $outstring .= " (name = $name)" if $name ne $branch;
                 # FIXME: here is where we could crossref against spreadsheet
                 if ($jobs_wanted) {
                     if (my $expect = $jobs_wanted->{$branch}) {
                         if ($job->{expression} ne $expect) {
-                            print " [ DESIRED: $expect ]";
+                            $outstring .= " [ DESIRED: $expect ]";
                         }
 
                         delete $jobs_wanted->{$branch};
                     }
                     else {
-                        print " [NOT IN SPREADSHEET]";
+                        $outstring .= " [NOT IN SPREADSHEET]";
                     }
                 }
-                print "\n";
+
+                $outstring =~ s/\s+$//;
+                print $outstring, "\n";
             }
 
             if ($want{$projname}) {
