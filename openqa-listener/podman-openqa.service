@@ -1,0 +1,15 @@
+# systemd unit file for the message bus listener (fedmsg)
+# that monitors podman-openqa
+[Unit]
+Description=podman OpenQA fedmsg listener
+
+[Service]
+Type=simple
+WorkingDirectory=/home/REPLACEME/.config/fedora-messaging
+Environment=PYTHONPATH=.
+ExecStart=fedora-messaging --conf podman.toml consume
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
