@@ -27,18 +27,10 @@ our $URL = 'https://api.cirrus-ci.com/graphql';
 # Link for human to make changes. Code below appends repo ID
 our $UI_URL = 'https://cirrus-ci.com/settings/repository/';
 
-# File > Download > PDF
-#    Export           = Workbook (not Current sheet)
-#    Page orientation = Landscape
-#    Scale            = Fit to width
-#    Margins          = Normal
-#    Headers & footers
-#         [ ] Page numbers
-#         [X] Workbook title
-#         [X] Sheet name
-#         [X] Current date
-#         [X] Current time
+# https://rclone.org/drive/   (rh, drive.readonly)
+#    $ rclone sync rh: ~/doc/rclone/
 #
+# ...or just File -> Download the spreadsheet.
 our $Spreadsheet = "$ENV{HOME}/doc/rclone/Containers/Cirrus-Cron Calculator.xlsx";
 
 # END   user-customizable section
@@ -58,23 +50,12 @@ PROJECT arg(s), if present, restrict output to only the
 given project(s).
 
 
-The spreadsheet is expected to be PDF and in your home dir:
+The spreadsheet is expected to be under your home dir:
 
   $Spreadsheet
 
-PDF, not a real spreadsheet format, because (1) formulas are
-hard, and (2) it's real easy to read pdf. Unfortunately it's
-not so easy to generate. You need to:
-
-  File > Download > PDF
-
-...and make sure you export _Workbook_ (not "Current sheet")
-and select, under Headers & footers:
-
-   Work book title
-   Sheet name
-   Current date
-   Current time
+I recommend rclone [ https://rclone.org/drive/ ] but you can
+just download it from gdrive.
 
 OPTIONS:
 
@@ -299,40 +280,52 @@ sub read_spreadsheet {
     my $parser   = Spreadsheet::ParseXLSX->new();
     my $workbook = $parser->parse($Spreadsheet);
     defined $workbook
-        or die $parser->error(), "\n";
+        or die "$ME: ", $parser->error(), "\n";
 
     my %by_project;
 
+    # Spreadsheet file has multiple worksheets (tabs).
     for my $worksheet ( $workbook->worksheets() ) {
+        # First one is called "Template Cirrus-Cron", ignore it
         my $name = $worksheet->get_name();
         next if $name =~ /Template/;
 
+        # All others are real projects, but capitalized (eg "Buildah").
+        # We need lower-case for consistency with Cirrus cron.
         my $project = lc($name);
 
-        my ( $row_min, $row_max ) = $worksheet->row_range();
-        my ( $col_min, $col_max ) = $worksheet->col_range();
+        # Each row is of the form
+        #  | Branch Name | Duration | Start Time | Cirrus-Cron String | EOL Date |
+        my ( undef, $row_max ) = $worksheet->row_range();
 
       ROW:
         for my $row ( 2 .. $row_max ) {
-            my $branch_ref = $worksheet->get_cell($row, 0)
+            # Helper function, a safe way to get_cell()->value()
+            my $get = sub {
+                my $tmp = $worksheet->get_cell( $row, @_ )
+                    or return '';
+                $tmp->value() || '';
+            };
+
+            my $branch = $get->(0)
                 or next ROW;
-            my $branch = $branch_ref->value()
-                or next ROW;
-            my $cron_entry_ref = $worksheet->get_cell($row, 3)
-                or next ROW;
-            my $cron_entry = $cron_entry_ref->value()
+            my $cron_entry = $get->(3)
                 or next ROW;
 
+            # Give a heads-up a month in advance of EOL
+            if (my $eol = $get->(4)) {
+                if ($eol =~ /^(\d+-\d+-\d+)$/) {
+                    my $eol_t = str2time($eol);
 
-            if ($cron_entry =~ s/\s+(\d+-\d+-\d+)//) {
-                my $eol = $1;
-                my $eol_t = str2time($eol);
-
-                if ($eol_t < time) {
-                    warn "$ME: $project $branch: EOL date $eol is past!\n";
+                    if ($eol_t < time) {
+                        warn "$ME: $project $branch: EOL date $eol is past!\n";
+                    }
+                    elsif (($eol_t - time) < 30 * 86400) {
+                        warn "$ME: $project $branch: EOL date $eol is coming up!\n";
+                    }
                 }
-                elsif (($eol_t - time) < 7 * 86400) {
-                    warn "$ME: $project $branch: EOL date $eol is coming up!\n";
+                else {
+                    warn "$ME: $project $branch: malformed EOL date '$eol'\n";
                 }
             }
 
@@ -340,7 +333,7 @@ sub read_spreadsheet {
             $cron_entry =~ s/\s+\*$//;
 
             if (exists $by_project{$project}{$branch}) {
-                die "$ME: duplicate entries for $project $branch: replacing with $cron_entry\n";
+                die "$ME: duplicate entries for $project $branch, cannot continue\n";
             }
             $by_project{$project}{$branch} = $cron_entry;
         }
