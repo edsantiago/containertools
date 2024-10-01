@@ -137,6 +137,8 @@ sub doit {
 
                 # Don't print yet. Gather output into a string, so we can trim trailing whitespace.
                 my $outstring = sprintf("   %-20s %-20s", $branch, $job->{expression});
+                # For readability: right-align and pad single digits
+                while ($outstring =~ s/(\d)\s(\d)\s/$1  $2 /) { }
                 my $name = $job->{name};
                 $outstring .= " (name = $name)" if $name ne $branch;
                 # FIXME: here is where we could crossref against spreadsheet
