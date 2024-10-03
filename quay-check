@@ -1,0 +1,283 @@
+#!/usr/bin/perl
+#
+# quay-check - monitor image descriptions on quay.io
+#
+package Containers::QuayCheck;
+
+use v5.14;
+use utf8;
+use open qw( :encoding(UTF-8) :std );
+
+use strict;
+use warnings;
+
+(our $ME = $0) =~ s|.*/||;
+our $VERSION = '0.2';
+
+###############################################################################
+# BEGIN user-customizable section
+
+# Git directory where we keep a cache and history of images
+our $Cache_Dir = "$ENV{HOME}/.cache/$ME";
+
+# List of quay.io namespaces. Maybe some day we'll add podman/buildah/skopeo
+our @Repos = qw(libpod);
+
+# END   user-customizable section
+###############################################################################
+
+###############################################################################
+# BEGIN boilerplate args checking, usage messages
+
+sub usage {
+    print  <<"END_USAGE";
+Usage: $ME [OPTIONS] [image ...]
+
+$ME queries quay.io for repo images and:
+
+  1. saves a local copy of what it finds; and
+  2. warns about images without "Description updated: YYYY-MM-DD"
+
+OPTIONS:
+
+  -v, --verbose  show verbose progress indicators
+
+  --help         display this message
+  --version      display program name and version
+END_USAGE
+
+    exit;
+}
+
+# Command-line options.  Note that this operates directly on @ARGV !
+our $debug   = 0;
+our $force   = 0;
+our $verbose = 0;
+our $NOT     = '';              # print "blahing the blah$NOT\n" if $debug
+sub handle_opts {
+    use Getopt::Long;
+    GetOptions(
+        'debug!'     => \$debug,
+        'dry-run|n!' => sub { $NOT = ' [NOT]' },
+        'force'      => \$force,
+        'verbose|v'  => \$verbose,
+
+        help         => \&usage,
+        version      => sub { print "$ME version $VERSION\n"; exit 0 },
+    ) or die "Try `$ME --help' for help\n";
+}
+
+# END   boilerplate args checking, usage messages
+###############################################################################
+
+############################## CODE BEGINS HERE ###############################
+
+# The term is "modulino".
+__PACKAGE__->main()                                     unless caller();
+
+# Main code.
+sub main {
+    # Note that we operate directly on @ARGV, not on function parameters.
+    # This is deliberate: it's because Getopt::Long only operates on @ARGV
+    # and there's no clean way to make it use @_.
+    handle_opts();                      # will set package globals
+
+    if (! -d $Cache_Dir) {
+        mkdir $Cache_Dir, 0755
+            or die "$ME: mkdir $Cache_Dir: $!\n";
+        system('git', '-C' => $Cache_Dir, 'init') == 0
+            or die "$ME: Could not git-init in $Cache_Dir\n";
+    }
+    chdir $Cache_Dir
+        or die "$ME: Cannot cd $Cache_Dir: $!\n";
+
+    my @queries = ('');
+    if (@ARGV) {
+        @queries = ();
+        for my $arg (@ARGV) {
+            $arg =~ /^([a-z0-9_-]+)$/
+                or die "$ME: Invalid image name '$arg'; must be alphanum, dash, underscore\n";
+            push @queries, $1;
+        }
+    }
+
+    quay_check(@queries);
+}
+
+################
+#  quay_check  #  One or more queries on one quay repo
+################
+sub quay_check {
+    my @queries = @_;                   # (optional) subset of query strings
+
+    for my $owner (@Repos) {
+        my %already_have = read_cache_dir($owner);
+        my @needs_update;
+
+      QUERY:
+        for my $q (@queries) {
+            my %from_quay = query_quay($owner, $q);
+
+            if (! keys %from_quay) {
+                warn "$ME: WARNING: No results for $owner/$q\n";
+                next QUERY;
+            }
+
+            for my $image (keys %from_quay) {
+                my $desc_old = delete($already_have{$image}) || '';
+                my $desc_new = $from_quay{$image}            || '';
+
+                if ($desc_new ne $desc_old) {
+                    # Description changed. Update file.
+                    write_description("$owner/$image", $desc_new);
+                }
+
+                # Images with this magic string are OK
+                if ($desc_new !~ /\bDescription\s+Updated:\s*(\d+-\d+-\d+)/i) {
+                    push @needs_update, [ $image, $desc_new ];
+                }
+            }
+        }
+
+        # Warn about images without a magic string
+        if (@needs_update) {
+            my $msg = "The following quay.io/$owner image";
+            if (@needs_update == 1) {
+                $msg .= " needs";
+            }
+            else {
+                $msg .= "s need";
+            }
+            $msg .= " a description:";
+            warn "$ME: $msg\n";
+
+            for my $tuple (sort { $a->[0] cmp $b->[0] } @needs_update) {
+                my ($image, $description) = @$tuple;
+                $msg = "   https://quay.io/repository/$owner/$image";
+                if ($verbose) {
+                    if ($description) {
+                        $msg .= "\n      $description\n";
+                    }
+                }
+                warn "$msg\n";
+            }
+        }
+
+        # In normal invocation (query all images), check for any that vanished.
+        # Do not do this if command-line called with specific images.
+        if (! "@queries") {
+            if (my @removed = sort keys %already_have) {
+                my $msg = "The following image";
+                if (@removed == 1) {
+                    $msg .= " has";
+                }
+                else {
+                    $msg .= "s have";
+                }
+                $msg .= " been removed:";
+                warn "$ME: $msg\n";
+
+                for my $image (@removed) {
+                    warn "   quay.io/$owner/$image\n";
+                    system('git', 'rm', '-q', "$owner/$image");
+                }
+            }
+        }
+    }
+
+    system('git', 'diff', '--cached');
+    if (qx{git status --porcelain} ne "") {
+        system('git', 'commit', '-a', "-mCommit by $ME v$VERSION");
+    }
+}
+
+
+####################
+#  read_cache_dir  #  Returns hash of images we already know, with their cached descriptions
+####################
+sub read_cache_dir {
+    my $owner = shift;                          # in: libpod, podman, ...
+
+    if (! -d $owner) {
+        mkdir $owner, 0755
+            or die "$ME: mkdir $Cache_Dir/$owner: $!\n";
+    }
+
+    my %cached;
+    opendir my $dir_fh, $owner
+        or die "$ME: opendir $Cache_Dir/$owner: $!\n";
+    for my $f (readdir $dir_fh) {
+        next if $f =~ /^\./;            # skip dotfiles
+
+        # Side effect: clean up tmpfiles from any crashed prior run
+        if ($f =~ /\.tmp/) {
+            unlink $f;
+            next;
+        }
+
+        open my $file_fh, '<', "$owner/$f"
+            or die "$ME: cannot read $owner/$f: $!\n";
+        $cached{$f} = do { local $/ = undef; <$file_fh>; };
+        close $file_fh;
+    }
+    closedir $dir_fh;
+
+    return %cached;
+}
+
+sub query_quay {
+    my $owner = shift;                  # in: repo owner (eg libpod)
+    my $q     = shift;                  # in: query string
+    my %results;                        # out: AREF of [ image, description ]
+
+    my $repo = "quay.io/$owner";
+    my @cmd = ('podman', 'search',
+               '--limit' => 999,
+               '--no-trunc',
+               '--format' => '{{.Name}} {{.Description}}',
+               "$repo/$q"
+           );
+
+    open my $fh, '-|', @cmd
+        or die "$ME: Cannot fork: $!\n";
+    while (my $response = <$fh>) {
+        chomp $response;
+        my ($image, $description) = split ' ', $response, 2;
+
+        substr($image, 0, length($repo)) eq $repo
+            or die "$ME: Unexpected result from $repo : '$image'\n";
+
+        $image = substr($image, length($repo)+1);
+
+        # Descriptions are often multiline, but podman (or perhaps quay)
+        # converts those to double space. Convert back, at the risk of
+        # falsely interpreting actual double spaces.
+        ($results{$image} = $description) =~ s/\s\s/\n/g;
+    }
+
+    close $fh
+        or die "$ME: Error running @cmd\n";
+
+    return %results;
+}
+
+sub write_description {
+    my $path = shift;                   # in: file path
+    my $desc = shift;                   # in: text to write
+
+    my $tmpfile = "$path.tmp.$$";
+    open my $fh_out, '>', $tmpfile
+        or die "$ME: Cannot create $Cache_Dir/$tmpfile: $!\n";
+    print { $fh_out } $desc, "\n";
+    close $fh_out
+        or die "$ME: Error writing $Cache_Dir/$tmpfile: $!\n";
+    chmod 0444, $tmpfile;
+    rename $tmpfile => $path
+        or die "$ME: mv $tmpfile: $!\n";
+
+    system('git', 'add', $path) == 0
+        or die "$ME: failed: git add $path\n";
+}
+
+
+1;
