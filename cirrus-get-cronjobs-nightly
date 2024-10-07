@@ -1,0 +1,24 @@
+#!/bin/bash
+#
+# cirrus-get-cronjobs-nightly - nightly cron job, alerts of diffs
+#
+ME=$(basename $0)
+
+CACHEDIR=$HOME/.cache/$ME
+
+outfile=cirrus-cron-jobs.txt
+
+set -e
+
+
+cd $CACHEDIR
+
+cirrus-get-cronjobs > $outfile.tmp.$$ && mv $outfile.tmp.$$ $outfile
+
+if git diff --exit-code; then
+    # No changes
+    exit 0
+fi
+
+# Something changed. Log it.
+git commit -amcheckpoint
