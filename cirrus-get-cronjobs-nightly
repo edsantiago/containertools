@@ -17,8 +17,11 @@ cirrus-get-cronjobs > $outfile.tmp.$$ && mv $outfile.tmp.$$ $outfile
 
 if git diff --exit-code; then
     # No changes
-    exit 0
+    :
+else
+    # Something changed. Log it.
+    git commit -amcheckpoint
 fi
 
-# Something changed. Log it.
-git commit -amcheckpoint
+# Either way, check for warnings (four or more ALL CAPS letter)
+grep -E '[A-Z]{4}' $outfile || true
