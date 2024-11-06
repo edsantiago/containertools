@@ -1,0 +1,406 @@
+#!/usr/bin/perl
+#
+# cirrus-flake-assign - assign a cause/issue to a flake
+#
+# $Id: cirrus-flake-assign,v 1.17 2024/08/19 20:06:08 esm Exp esm $
+#
+package LibPod::CirrusFlakeAssign;
+
+use v5.14;
+use utf8;
+use open qw( :encoding(UTF-8) :std );
+
+use strict;
+use warnings;
+
+(our $ME = $0) =~ s|.*/||;
+(our $VERSION = '$Revision: 1.17 $ ') =~ tr/[0-9].//cd;
+
+# For debugging, show data structures using DumpTree($var)
+use Data::TreeDumper; $Data::TreeDumper::Displayaddress = 0;
+
+###############################################################################
+# BEGIN user-customizable section
+
+our $Project = 'podman';
+
+our $DB_Dir = "/home/esm/.local/share/cirrus-flake-summarize";
+
+$ENV{TZ} = 'US/Eastern';
+
+# END   user-customizable section
+###############################################################################
+
+use DBI;
+use DBD::SQLite::Constants      qw(:dbd_sqlite_string_mode);
+use JSON;
+use LWP::UserAgent;
+use Term::ANSIColor;
+use Time::Piece;
+
+###############################################################################
+# BEGIN boilerplate args checking, usage messages
+
+sub usage {
+    print  <<"END_USAGE";
+Usage: $ME [OPTIONS] ISSUE FLAKE-ID [FLAKE-ID....]
+
+$ME assigns FLAKE-ID(s) to ISSUE: it sets a field in my DB
+such that FLAKE-ID is sorted into the ISSUE bucket.
+
+ISSUE should be a number, but can also be a "quoted string", in
+which case I'll try to search github for issues with label:flakes
+and with that string in the title.
+
+OPTIONS:
+
+  --project=PROJ may be podman, buildah, or skopeo (default: $Project)
+
+  --quick        do not regenerate the xref-html list (default)
+
+  --nuke         delete all other flakes in the given task. Used
+                 for the unlinkat/EBUSY and unmount/EINVAL flakes,
+                 where everything else is hosed after that error.
+
+  -v, --verbose  show verbose progress indicators
+  -n, --dry-run  make no actual changes
+
+  --help         display this message
+  --man          display program man page
+  --version      display program name and version
+END_USAGE
+
+    exit;
+}
+
+# Command-line options.  Note that this operates directly on @ARGV !
+our $opt_nuke;
+our $debug   = 0;
+our $force   = 0;
+our $quick   = 1;               # do not regenerate (time-consuming) xref list
+our $verbose = 0;
+our $NOT     = '';              # print "blahing the blah$NOT\n" if $debug
+sub handle_opts {
+    use Getopt::Long;
+    GetOptions(
+        'project=s'  => \$Project,
+        'buildah'    => sub { $Project = 'buildah' },
+        'skopeo'     => sub { $Project = 'skopeo' },
+
+        'nuke'       => \$opt_nuke,
+
+        'debug!'     => \$debug,
+        'dry-run|n!' => sub { $NOT = ' [NOT]' },
+        'force'      => \$force,
+        'quick!'     => \$quick,
+        'verbose|v'  => \$verbose,
+
+        help         => \&usage,
+        version      => sub { print "$ME version $VERSION\n"; exit 0 },
+    ) or die "Try `$ME --help' for help\n";
+}
+
+# END   boilerplate args checking, usage messages
+###############################################################################
+
+############################## CODE BEGINS HERE ###############################
+
+# The term is "modulino".
+__PACKAGE__->main()                                     unless caller();
+
+# Main code.
+sub main {
+    # Note that we operate directly on @ARGV, not on function parameters.
+    # This is deliberate: it's because Getopt::Long only operates on @ARGV
+    # and there's no clean way to make it use @_.
+    handle_opts();                      # will set package globals
+
+    # FIXME: handle issues, text comments (placeholders), non-project issues?
+    my $issue = shift(@ARGV)
+        or die "$ME: Missing ISSUE argument; see $ME --help\n";
+
+    @ARGV
+        or die "$ME: Missing ID argument(s); see $ME --help\n";
+
+    # e.g., "buildah/5674"
+    if ($issue =~ m!^((([\w_-]+)/)?(\d+))$!) {
+        $issue = $1;
+    }
+    # e.g., "quay flakes"
+    elsif ($issue =~ /\D/) {
+        $issue = find_issue_by_title($issue);
+    }
+
+    my $issue_title = issue_title($issue);
+    print "*** -> #$issue $issue_title\n";
+
+    for my $id (@ARGV) {
+        $id =~ /^(\d{1,12})$/
+            or die "$ME: Invalid ID '$id'; must be a number\n";
+        $id = $1;
+
+        doit($id, $issue, $issue_title);
+    }
+
+    # Regenerate the HTML list, but don't push it.
+    exec('cirrus-flake-xref') unless $quick;
+}
+
+sub doit {
+    my ($id, $issue, $issue_title) = @_;
+
+    my $db = "$DB_Dir/$Project/db.sqlite";
+    my $dbh = DBI->connect("dbi:SQLite:dbname=$db")
+        or die "$ME: Cannot DBI->connect to db: $@";
+    $dbh->{sqlite_string_mode} = DBD_SQLITE_STRING_MODE_UNICODE_STRICT;
+
+    my $sth = $dbh->prepare('SELECT * FROM flakes WHERE id=?');
+    $sth->execute($id);
+
+    my $row = $sth->fetchrow_hashref();
+    exists $row->{id}
+        or die "$ME: $id not found in DB\n";
+
+    if (my $orig = $row->{flake_orig}) {
+        warn "$ME: flake $id already marked as #$row->{flake}: $orig\n";
+        die  "$ME: Aborting\n" unless $force;
+        warn "$ME: Proceeding due to --force\n";
+        # So we don't re-clobber flake_orig below
+        $row->{flake} = $row->{flake_orig};
+    }
+
+#    use Data::Dump; dd $row;
+    my $t = localtime($row->{timestamp}/1000);
+    printf "\n%s\n  %s\n    PR %s @ %s\n",
+        $row->{flake}, $row->{testname}, $row->{pr},
+        $t->strftime("%m-%d %H:%M");
+
+    # FIXME: set flake_orig to flake
+    # FIXME: set flake to $issue
+    $| = 1;
+    print "    - Ok? ";
+    my $ans = <STDIN>;
+    return unless $ans =~ /^y/i;
+
+    if ($issue eq 'DELETE') {
+        $sth = $dbh->prepare('DELETE FROM flakes WHERE id=?');
+        $sth->execute($id);
+    }
+    else {
+        $sth = $dbh->prepare('UPDATE flakes SET flake_orig=?, flake=? WHERE id=?');
+        $sth->execute($row->{flake}, $issue, $id);
+    }
+
+    # FIXME FIXME: special case, because in this issue all subsequent tests fail
+    if ($opt_nuke) {
+        my $taskid = $row->{taskid};
+
+        $sth = $dbh->prepare('SELECT COUNT(*) FROM flakes WHERE taskid=? AND flake_orig IS NULL');
+        $sth->execute($taskid);
+
+        my $count = $sth->fetchrow_hashref();
+        exists $count->{'COUNT(*)'}
+            or die "$ME: WEIRD: did not find COUNT(*)\n";
+        my $n = $count->{'COUNT(*)'}
+            or do {
+                warn "$ME: no other flakes found in task $taskid\n";
+                return;
+            };
+
+        printf "    - Delete %d others in task %d ? ", $n, $row->{taskid};
+        $ans = <STDIN>;
+        return unless $ans =~ /^y/i;
+
+        $sth = $dbh->prepare("DELETE FROM flakes WHERE taskid=? AND flake_orig IS NULL");
+        $sth->execute($taskid);
+    }
+}
+
+sub issue_title {
+    my $issue   = shift;
+
+    my $issue_project = $Project;
+    if ($issue =~ s!^(\S+)/!!) {
+        $issue_project = $1;
+    }
+
+    return 'PLACEHOLDER' if $issue =~ /^999\d+$/;
+    return $issue        if $issue eq 'DELETE';
+
+    my $ua = LWP::UserAgent->new;
+    $ua->agent("$ME " . $ua->agent);              # Identify ourself
+
+    my $token = $ENV{GITHUB_TOKEN}
+        or die "$ME: Please set \$GITHUB_TOKEN\n";
+
+    my %headers = (
+        'Authorization' => "bearer $token",
+        'Accept'        => "application/vnd.github.antiope-preview+json",
+        'Content-Type'  => "application/json",
+    );
+    $ua->default_header($_ => $headers{$_}) for keys %headers;
+
+    my $query = <<"END_QUERY";
+query {
+  repository(owner:"containers", name:"$issue_project") {
+    issueOrPullRequest(number:$issue) {
+      ... on Issue {
+         __typename
+         title
+      }
+      ... on PullRequest {
+         __typename
+         title
+      }
+    }
+  }
+}
+END_QUERY
+
+    # Escape quotes
+    $query =~ s/\"/\\"/g; $query =~ s/\n/ /g; $query =~ s/\s+/ /g;
+    my $postquery = qq/{ "query": "$query" }/;
+
+    my $res = $ua->post('https://api.github.com/graphql',
+                        Content => $postquery);
+    if ((my $code = $res->code) != 200) {
+        use Term::ANSIColor qw(:constants);
+        printf "%s%03d%s", ($code < 400 ? YELLOW : RED), $code, RESET;
+        use Data::Dumper; print Dumper($res);
+        exit 1;
+    }
+
+    my $content = decode_json($res->content)
+        or die "$ME: No results for $query\n";
+
+#    use Data::Dump; dd $content;
+    my $value = $content;
+    for my $field (qw(data repository issueOrPullRequest title)) {
+        $value = $value->{$field}
+            or do {
+                print "\n";
+                use Data::Dump; dd $content;
+                die "$ME: Could not get $field from $content";
+            };
+    }
+
+    my $type = $content->{data}{repository}{issueOrPullRequest}{__typename};
+    if ($type ne 'Issue') {
+        warn "$ME: $issue is '$type', not Issue\n";
+        warn "$ME: $value\n";
+
+        $| = 1;
+        print "  -- proceed? ";
+        my $ans = <STDIN>;
+        exit 0 unless $ans =~ /^y/i;
+    }
+
+    return $value;
+}
+
+
+sub find_issue_by_title {
+    my $title = shift;
+    return $title if $title eq 'DELETE';
+
+    my $want_state = 'open';
+    if ($title =~ s/\s*CLOSED\s*/ /) {
+        $want_state = 'closed';
+    }
+
+    my @keywords = split(' ', $title);
+
+    my $ua = LWP::UserAgent->new;
+    $ua->agent("$ME " . $ua->agent);              # Identify ourself
+
+    my $token = $ENV{GITHUB_TOKEN}
+        or die "$ME: Please set \$GITHUB_TOKEN\n";
+
+    my %headers = (
+        'Authorization' => "bearer $token",
+        'Accept'        => "application/vnd.github.antiope-preview+json",
+        'Content-Type'  => "application/json",
+    );
+    $ua->default_header($_ => $headers{$_}) for keys %headers;
+
+    my $query = <<"END_QUERY";
+query {
+    search(query: "repo:containers/$Project is:issue is:$want_state label:flakes @keywords in:title", type:ISSUE, first:5) {
+        edges { node { ... on Issue { title, number } } }
+    }
+}
+END_QUERY
+
+    # Escape quotes
+    $query =~ s/\"/\\"/g; $query =~ s/\n/ /g; $query =~ s/\s+/ /g;
+    my $postquery = qq/{ "query": "$query" }/;
+
+    my $res = $ua->post('https://api.github.com/graphql',
+                        Content => $postquery);
+    if ((my $code = $res->code) != 200) {
+        use Term::ANSIColor qw(:constants);
+        printf "%s%03d%s", ($code < 400 ? YELLOW : RED), $code, RESET;
+        use Data::Dumper; print Dumper($res);
+        exit 1;
+    }
+
+    my $content = decode_json($res->content)
+        or die "$ME: No results for $query\n";
+
+    #use Data::Dump; dd $content;
+    my $value = $content;
+    for my $field (qw(data search edges)) {
+        $value = $value->{$field}
+            or do {
+                print "\n";
+                use Data::Dump; dd $content;
+                die "$ME: ^^^ Could not get $field from $content";
+            };
+    }
+
+    ref($value) eq 'ARRAY'
+        or die "$ME: 'data -> search -> edges' is not an array!";
+
+    # Convert deep struct to array of arefs [ issueID, title ]
+    my @match = map { [ @{$_->{node}}{"number","title"} ] } @$value;
+    #use Data::Dump; dd \@match;
+
+    if (@match < 1) {
+        die "$ME: No match for '$query'";
+    }
+    if (@match > 1) {
+        warn "$ME: multiple matches:\n";
+        warn "   @$_\n"  for @match;
+        exit 1;
+    }
+
+    return $match[0][0];
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+1;

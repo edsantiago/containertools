@@ -1,0 +1,316 @@
+#!/usr/bin/perl
+#
+# cirrus-flake-grep - search for flake patterns in logs
+#
+# $Id: cirrus-flake-grep,v 1.10 2024/02/08 13:51:33 esm Exp esm $
+#
+package ESM::CirrusFlakeGrep;
+
+use v5.14;
+use utf8;
+use open qw( :encoding(UTF-8) :std );
+
+use strict;
+use warnings;
+no warnings 'utf8';
+
+(our $ME = $0) =~ s|.*/||;
+(our $VERSION = '$Revision: 1.10 $ ') =~ tr/[0-9].//cd;
+
+# For debugging, show data structures using DumpTree($var)
+#use Data::TreeDumper; $Data::TreeDumper::Displayaddress = 0;
+
+###############################################################################
+# BEGIN user-customizable section
+
+our $Base_Dir = "/home/esm/.local/share/cirrus-flake-summarize";
+
+our $Project = 'podman';
+
+# END   user-customizable section
+###############################################################################
+
+use DBI;
+use File::Find;
+use Term::ANSIColor;
+use Time::Piece;
+
+###############################################################################
+# BEGIN boilerplate args checking, usage messages
+
+sub usage {
+    print  <<"END_USAGE";
+Usage: $ME [OPTIONS] ARGS [...]
+
+blah blah blah
+
+OPTIONS:
+
+  --project P    project (default: $Project)
+
+  -v, --verbose  show verbose progress indicators
+  -n, --dry-run  make no actual changes
+
+  --help         display this message
+  --man          display program man page
+  --version      display program name and version
+END_USAGE
+
+    exit;
+}
+
+sub man {
+    # Read the POD contents.  If it hasn't been filled in yet, abort.
+    my $pod = do { local $/; <DATA>; };
+    if ($pod =~ /=head1 \s+ NAME \s+ FIXME/xm) {
+        warn "$ME: No man page available.  Please try $ME --help\n";
+        exit;
+    }
+
+    # Use Pod::Man to convert our __DATA__ section to *roff
+    eval { require Pod::Man }
+        or die "$ME: Cannot generate man page; Pod::Man unavailable: $@\n";
+    my $parser = Pod::Man->new(name => $ME, release => $VERSION, section => 1);
+
+    # If called without output redirection, man-ify.
+    my $out_fh;
+    if (-t *STDOUT) {
+        my $pager = $ENV{MANPAGER} || $ENV{PAGER} || 'less';
+        open $out_fh, "| nroff -man | $pager";
+    }
+    else {
+        open $out_fh, '>&STDOUT';
+    }
+
+    # Read the POD contents, and have Pod::Man read from fake filehandle.
+    # This requires 5.8.0.
+    open my $pod_handle, '<', \$pod;
+    $parser->parse_from_filehandle($pod_handle, $out_fh);
+    exit;
+}
+
+
+# Command-line options.  Note that this operates directly on @ARGV !
+our $debug   = 0;
+our $force   = 0;
+our $verbose = 0;
+our $NOT     = '';              # print "blahing the blah$NOT\n" if $debug
+sub handle_opts {
+    use Getopt::Long;
+    GetOptions(
+        'project=s'  => \$Project,
+        'buildah'    => sub { $Project = 'buildah' },
+        'skopeo'     => sub { $Project = 'skopeo' },
+
+        'debug!'     => \$debug,
+        'dry-run|n!' => sub { $NOT = ' [NOT]' },
+        'force'      => \$force,
+        'verbose|v'  => \$verbose,
+
+        help         => \&usage,
+        man          => \&man,
+        version      => sub { print "$ME version $VERSION\n"; exit 0 },
+    ) or die "Try `$ME --help' for help\n";
+}
+
+# END   boilerplate args checking, usage messages
+###############################################################################
+
+############################## CODE BEGINS HERE ###############################
+
+# The term is "modulino".
+__PACKAGE__->main()                                     unless caller();
+
+# Main code.
+sub main {
+    # Note that we operate directly on @ARGV, not on function parameters.
+    # This is deliberate: it's because Getopt::Long only operates on @ARGV
+    # and there's no clean way to make it use @_.
+    handle_opts();                      # will set package globals
+
+    # Fetch command-line arguments.  Barf if too many.
+    my $pattern = shift(@ARGV)
+        or die "$ME: missing PATTERN argument; try $ME --help\n";
+    die "$ME: Too many arguments; see $ME --help\n" if @ARGV;
+
+    look_for("$Base_Dir/$Project", $pattern);
+}
+
+
+sub look_for {
+    my $dir     = shift;
+    my $pattern = shift;
+
+    my @cmd = ('grep', '-Rl', $pattern, $dir);
+    open my $grep, '-|', @cmd
+        or die "$ME: Could not fork: $!\n";
+
+    while (my $path = <$grep>) {
+        chomp $path;
+        $path =~ m!/logs/(\d+)/(\d+)/!
+            or die "$ME: Unexpected output from grep: $path\n";
+        my ($pr, $taskid) = ($1, $2);
+
+        open my $fh, '<', $path
+            or die "$ME: Cannot read $path: $!\n";
+
+        my $after_dash_separator = 999999999;       # for integration tests
+        my $current_test = '[unknown test]';
+        my @context;
+
+      LINE:
+        while (my $line = <$fh>) {
+            $after_dash_separator++;
+            chomp $line;
+
+            # FIXME: keep a circular buffer?
+            push @context, $line;
+            shift @context if @context > 5;
+
+            # keep track of the current test name
+            if ($line =~ /(\[Fail\]|\[Panic\!\]|not ok|FAIL:)\s+(.*)/o) {
+                $current_test = $2
+                    unless ($1 eq 'FAIL:' && index($path, '/sys') > 0);
+            }
+            elsif ($line =~ /^\[.*?\]\s+-{20,}\s*$/o) {
+                $after_dash_separator = 0;
+            }
+            elsif ($after_dash_separator == 2) {
+                # integration tests: test name is 2 lines after the '------' line
+                ($current_test = $line) =~ s/^\[[^]]+\]\s+//;
+            }
+            elsif ($after_dash_separator == 4) {
+                if ($line =~ /^\[.....s\]   (\S.*)/) {
+                    $current_test .= " - $1";
+                }
+            }
+
+            next LINE unless $line =~ /$pattern/;
+
+            # Found it
+            my $taskinfo = taskinfo($taskid)
+                or do {
+                    warn "$ME: Warning: no taskinfo for $taskid; log $path\n";
+                    next LINE;
+                };
+
+            # Highlight the desired patterns
+            $context[-1] =~ s/($pattern)/\e[36m$1\e[0m/g;
+
+            print "\n", color('rgb050'), $current_test, color('reset'), " - ", $taskid, "\n";
+            print color('rgb530'), "* ", $taskinfo->{testname}, color('reset'),"\n";
+
+            my $t = localtime($taskinfo->{timestamp}/1000);
+            my $md = $t->strftime("%m-%d");
+            my $hm = $t->strftime("%H:%M");
+            $md = $t->year . "-$md"         if time - $t->epoch > 180 * 86400;
+
+            print "  * PR #", color('rgb115'), $taskinfo->{pr}, color('reset'),
+                " [$md $hm]\n";
+            print "   ", $_, "\n"  for @context;
+            print "  ", $taskinfo->{log}, "\n";
+        }
+        close $fh;
+    }
+}
+
+
+
+sub taskinfo {
+    my $taskid = shift;
+
+    my $db = "$Base_Dir/$Project/db.sqlite";
+    my $dbh = DBI->connect("dbi:SQLite:dbname=$db")
+        or die "$ME: Cannot DBI->connect to db: $@";
+
+    my $sql = 'SELECT * FROM flakes WHERE taskid=?';
+
+    my $sth = $dbh->prepare($sql);
+    $sth->execute($taskid);
+
+    my $result = $sth->fetchrow_hashref;
+    return $result;
+}
+
+
+
+1;
+
+__DATA__
+
+###############################################################################
+#
+# Documentation
+#
+
+=head1	NAME
+
+FIXME - description of what this script does
+
+=head1	SYNOPSIS
+
+FIXME [B<--foo>]  [B<--bar>]  [B<--verbose>] ARG1 [ARG2...] FIXME
+
+FIXME  B<--help>  |  B<--version> | B<--man>
+
+=head1	DESCRIPTION
+
+B<FIXME> grobbles the frobniz on alternate Tuesdays, except where
+prohibited by law.
+
+=head1	OPTIONS
+
+=over 4
+
+=item B<--foo>
+
+FIXME
+
+=item B<--verbose>
+
+Show progress messages.
+
+=item B<--help>
+
+Emit usage hints.
+
+=item B<--version>
+
+Display program version.
+
+=item B<--man>
+
+Display this man page.
+
+=back
+
+
+=head1	DIAGNOSTICS
+
+FIXME
+
+=head1	ENVIRONMENT
+
+FIXME
+
+=head1	FILES
+
+FIXME
+
+=head1	RESTRICTIONS
+
+FIXME
+
+=head1	SEE ALSO
+
+FIXME
+
+e.g. L<Foo::Bar|Foo::Bar>
+
+=head1	AUTHOR
+
+Your Name <ed@edsantiago.com>
+
+Please report bugs or suggestions to <ed@edsantiago.com>
+
+=cut

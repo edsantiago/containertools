@@ -1,0 +1,44 @@
+#!/bin/bash
+#
+# cirrus-flake-catchup - bring local database up-to-date
+#
+# FIXME: we need a better way, because some PRs won't be in db
+#
+# FIXME: AUGH! This lists by ID, not merge time! So 7845, which is an old
+# number that merged 10 minutes ago, does not show up in 7940..7871
+#
+if [[ -z $GITHUB_TOKEN ]]; then
+    echo "You need to set \$GITHUB_TOKEN" >&2
+    exit 1
+fi
+
+for PROJECT in podman buildah skopeo netavark; do
+    echo -e "\e[34m" $PROJECT "\e[m"
+
+    DB="/home/esm/.local/share/cirrus-flake-summarize/$PROJECT/db.sqlite"
+
+    curl -s -S -H "Authorization: bearer $GITHUB_TOKEN" -X POST --data '{ "query": "{ repository(owner:\"containers\", name: \"'$PROJECT'\") { pullRequests(states:[MERGED], first:30, orderBy: {field:UPDATED_AT,direction:DESC}) { nodes { number title } } } }" }' https://api.github.com/graphql \
+        | jq -r '.data.repository.pullRequests.nodes[] | "\(.number) \(.title)"' \
+        | while read pr rest; do
+        found=$(echo "SELECT COUNT(*) FROM flakes WHERE pr=$pr;" | sqlite3 $DB)
+        if ((found == 0)); then
+            merged=$(echo "SELECT COUNT(*) FROM merged WHERE pr=$pr;" | sqlite3 $DB)
+            if ((merged == 0)); then
+                echo
+                echo -e "\e[35m" $pr - $rest "\e[0m"
+                # FIXME: fail on error? Offer option to continue?
+                # "Could not get task ID" is okay for v3.2
+                cirrus-flake-summarize --project=$PROJECT $pr
+
+                # Mark as merged, so we don't do it again
+                echo "INSERT INTO merged VALUES ($pr);" | sqlite3 $DB
+            fi
+        fi
+    done
+
+    rm -f ~/public_html/cirrus-flake-xref/*tmp*
+
+    cirrus-flake-xref --project=$PROJECT
+done
+
+rsync -avP ~/public_html/cirrus-flake-xref/. irc:public_html/cirrus-flake-xref/.

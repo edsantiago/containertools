@@ -1,0 +1,730 @@
+#!/usr/bin/perl
+#
+# cirrus-flake-xref - generate cross-ref of cirrus flakes
+#
+# $Id: cirrus-flake-xref,v 1.55 2024/08/26 12:53:44 esm Exp esm $
+#
+package LibPod::CirrusFlakeCrossref;
+
+use v5.14;
+use utf8;
+use open qw( :encoding(UTF-8) :std );
+
+use strict;
+use warnings;
+
+(our $ME = $0) =~ s|.*/||;
+(our $VERSION = '$Revision: 1.55 $ ') =~ tr/[0-9].//cd;
+
+# For debugging, show data structures using DumpTree($var)
+use Data::TreeDumper; $Data::TreeDumper::Displayaddress = 0;
+
+###############################################################################
+# BEGIN user-customizable section
+
+our $Project = 'podman';
+
+our $DB_Dir = "/home/esm/.local/share/cirrus-flake-summarize";
+
+our $HTML_Dir = "/home/esm/public_html/$ME";
+
+$ENV{TZ} = 'US/Eastern';
+
+our $Since = 180;
+
+# END   user-customizable section
+###############################################################################
+
+use DBI;
+use DBD::SQLite::Constants      qw(:dbd_sqlite_string_mode);
+use JSON;
+use List::Util          qw(max);
+use LWP;
+use Term::ANSIColor;
+use Time::Piece;
+
+###############################################################################
+# BEGIN boilerplate args checking, usage messages
+
+sub usage {
+    print  <<"END_USAGE";
+Usage: $ME [OPTIONS] ARGS [...]
+
+blah blah blah
+
+OPTIONS:
+
+  --since=N      show only flakes occurring in the past N days (default: $Since)
+
+  --project=PROJ may be podman, buildah, or skopeo (default: $Project)
+
+  --markdown     dump Github markdown on stdout, suitable for filing a PR
+
+  -v, --verbose  show verbose progress indicators
+  -n, --dry-run  make no actual changes
+
+  --help         display this message
+  --man          display program man page
+  --version      display program name and version
+END_USAGE
+
+    exit;
+}
+
+sub man {
+    # Read the POD contents.  If it hasn't been filled in yet, abort.
+    my $pod = do { local $/; <DATA>; };
+    if ($pod =~ /=head1 \s+ NAME \s+ FIXME/xm) {
+        warn "$ME: No man page available.  Please try $ME --help\n";
+        exit;
+    }
+
+    # Use Pod::Man to convert our __DATA__ section to *roff
+    eval { require Pod::Man }
+        or die "$ME: Cannot generate man page; Pod::Man unavailable: $@\n";
+    my $parser = Pod::Man->new(name => $ME, release => $VERSION, section => 1);
+
+    # If called without output redirection, man-ify.
+    my $out_fh;
+    if (-t *STDOUT) {
+        my $pager = $ENV{MANPAGER} || $ENV{PAGER} || 'less';
+        open $out_fh, "| nroff -man | $pager";
+    }
+    else {
+        open $out_fh, '>&STDOUT';
+    }
+
+    # Read the POD contents, and have Pod::Man read from fake filehandle.
+    # This requires 5.8.0.
+    open my $pod_handle, '<', \$pod;
+    $parser->parse_from_filehandle($pod_handle, $out_fh);
+    exit;
+}
+
+
+# Command-line options.  Note that this operates directly on @ARGV !
+our $markdown;                  # dump github markdown on stdout
+our $Filter;
+our $debug   = 0;
+our $force   = 0;
+our $verbose = 0;
+our $NOT     = '';              # print "blahing the blah$NOT\n" if $debug
+sub handle_opts {
+    use Getopt::Long;
+    GetOptions(
+        'project=s'  => \$Project,
+        'buildah'    => sub { $Project = 'buildah' },
+        'skopeo'     => sub { $Project = 'skopeo' },
+
+        'markdown'   => \$markdown,
+        'since=i'    => \$Since,
+        'filter=s'   => \$Filter,
+
+        'debug!'     => \$debug,
+        'dry-run|n!' => sub { $NOT = ' [NOT]' },
+        'force'      => \$force,
+        'verbose|v'  => \$verbose,
+
+        help         => \&usage,
+        man          => \&man,
+        version      => sub { print "$ME version $VERSION\n"; exit 0 },
+    ) or die "Try `$ME --help' for help\n";
+}
+
+# END   boilerplate args checking, usage messages
+###############################################################################
+
+############################## CODE BEGINS HERE ###############################
+
+# The term is "modulino".
+__PACKAGE__->main()                                     unless caller();
+
+# Main code.
+sub main {
+    # Note that we operate directly on @ARGV, not on function parameters.
+    # This is deliberate: it's because Getopt::Long only operates on @ARGV
+    # and there's no clean way to make it use @_.
+    handle_opts();                      # will set package globals
+
+    # Fetch command-line arguments.  Barf if too many.
+    die "$ME: Too many arguments; try $ME --help\n"                 if @ARGV;
+
+    if ($Filter) {
+        die "$ME: --filter is only applicable with using --markdown\n"
+            unless $markdown;
+
+        no warnings 'redefine';
+        eval "sub color { return '' }";
+    }
+
+    # FIXME: do code here
+    doit();
+}
+
+sub doit {
+    my $db = "$DB_Dir/$Project/db.sqlite";
+    my $dbh = DBI->connect("dbi:SQLite:dbname=$db")
+        or die "$ME: Cannot DBI->connect to db: $@";
+    $dbh->{sqlite_string_mode} = DBD_SQLITE_STRING_MODE_UNICODE_STRICT;
+
+    my %by_flake;
+    # Find all unique flakes
+    my $sql = 'SELECT DISTINCT flake FROM flakes';
+    $sql .= " WHERE flake LIKE '%$Filter%'" if $Filter;
+    my $sth = $dbh->prepare($sql);
+    $sth->execute();
+    my $all_flakes = $sth->fetchall_arrayref;
+#    use Data::Dumper; print Dumper($all_flakes);
+
+    $sql = 'SELECT * FROM flakes WHERE flake=?';
+    if (defined $Since) {
+        $sql .= sprintf(" AND timestamp > %d000", $^T - $Since * 86400);
+    }
+    $sql .= " ORDER BY timestamp DESC";
+    my $sth2 = $dbh->prepare($sql);
+
+    # For each one, find the most recent instance.
+  FLAKE:
+    for my $flakeref (@$all_flakes) {
+        my $flake = $flakeref->[0];
+
+        $sth2->execute($flake);
+        my @all;
+        while (my $row = $sth2->fetchrow_hashref) {
+            push @all, $row;
+        }
+
+        # Skip if most recent instance is over 3 weeks old
+        next FLAKE if !@all;
+        next FLAKE if $all[0]->{timestamp} < $^T - 21 * 86400;
+
+        # BATS tests can be renumbered. Strip off the leading NNN so we
+        # actually track same-flake errors over time.
+        if (@all) {
+            if ($all[0]{testname} =~ /^(sys|compose|upgrade_test)\s/) {
+                my $tname = $1;
+                $flake =~ s/^\d{1,3}\s/$tname: /;
+            }
+        }
+
+        # Now organize by testname (eg fedora 31). FIXME: should we sort by PR?
+        $by_flake{$flake} //= { _timestamp => $all[0]->{timestamp} };
+        for my $instance (@all) {
+            my $testname = $instance->{image} . " : " . $instance->{testname};
+            $testname .= ' [remote]' if $instance->{remote};
+            my $pr       = $instance->{pr};
+            push @{ $by_flake{$flake}{$testname}{$pr} }, $instance;
+
+            $by_flake{$flake}{_count}++;
+            $by_flake{$flake}{_timestamp} = max($by_flake{$flake}{_timestamp},
+                                                $instance->{timestamp});
+        }
+    }
+
+#    print DumpTree(\%by_flake);
+
+    #
+    # Pass 2: Generate HTML
+    #
+    my $html_file = "$HTML_Dir/$Project.html";
+    my $html_tmp  = "$html_file.tmp.$$";
+    unlink $html_tmp;
+    open my $out, '>', $html_tmp
+        or die "$ME: Cannot create $html_tmp: $!\n";
+    print { $out } <<"END_HTML";
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html
+        PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+         "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en-US">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+  <title>Flakes: $Project</title>
+  <style type="text/css">
+h4         { margin-left: 2em; }
+
+.flakelist { margin-left: 4em; }
+.seen-in   { margin-left: 2em; }
+
+table      { border: 1px solid #ccc; border-collapse: collapse; }
+th         { border: 1px solid #ccc; text-align: left;                      vertical-align: top; }
+td         { border: 1px solid #ccc; padding-left: 4px; padding-right: 2px; vertical-align: top; }
+
+.ancient   { color: #eee; }
+.old       { color: #555; }
+.new       { background: #ff6; }
+.new a:link { font-weight: bold; }
+.new a:visited { font-weight: normal; }
+
+/* https://www.digitalocean.com/community/tutorials/css-collapsible */
+input[type='checkbox'] {
+  display: none;
+}
+
+.lbl-toggle {
+  display: block;
+
+  font-weight: bold;
+  font-family: monospace;
+  font-size: 1.2rem;
+  text-align: left;
+
+  padding: 1rem;
+
+  color: #A77B0E;
+  background: #FAE042;
+
+  cursor: pointer;
+
+  border-radius: 7px;
+  transition: all 0.25s ease-out;
+}
+
+.lbl-toggle.CLOSED {
+  color: #555555;
+  background: #CCCCCC;
+}
+.lbl-toggle.MERGED {
+  color: #ffffff;
+  background: #8250df;
+}
+.lbl-toggle.PLACEHOLDER {
+  color: #333333;
+  background: #ff3399;
+}
+
+.lbl-toggle:hover {
+  background: #FFFF00;
+}
+
+.lbl-toggle::before {
+  content: ' ';
+  display: inline-block;
+
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+  border-left: 5px solid currentColor;
+
+  vertical-align: middle;
+  margin-right: .7rem;
+  transform: translateY(-2px);
+
+  transition: transform .2s ease-out;
+}
+.collapsible-content {
+  max-height: 0px;
+  overflow: hidden;
+
+  transition: max-height .25s ease-in-out;
+}
+.toggle:checked + .lbl-toggle + .collapsible-content {
+  max-height: 10000vh;
+}
+.toggle:checked + .lbl-toggle::before {
+  transform: rotate(90deg) translateX(-3px);
+}
+
+.toggle:checked + .lbl-toggle {
+  border-bottom-right-radius: 0;
+  border-bottom-left-radius: 0;
+}
+  </style>
+</head>
+<body>
+END_HTML
+
+    # Title
+    print { $out } "<h1>Cirrus Flakes: <u>$Project</u>";
+    for my $proj (qw(podman buildah skopeo netavark)) {
+        if ($proj ne $Project) {
+            print { $out } " <small>[<a href=\"$proj\.html\">$proj</a>]</small>";
+        }
+    }
+    print { $out } "</h1>\n";
+
+    print { $out } <<"END_HTML";
+<p>
+Results below are sorted in reverse chronological order, based on
+the most recently seen flake. Primary key (yellow tab) is the failing
+subtest name <i>or</i>, in a few cases, a link to a github issue.
+Click on each yellow tab to expand (or vanish) the flake list. The
+expanded view is then sorted by <b>CI&nbsp;image</b> (local vs remote,
+fedora/ubuntu, root/rootless), and further entries are the PR where
+it failed and links to individual test logs.
+</p>
+<p>
+Bright yellow background in a test log indicates recent failure (within
+the last 5 days); regular text means last two weeks; ghosted means more
+than two weeks old.
+</p>
+<p>
+A flake is defined as any test that fails but then passes on rerun.
+That means <i>this list is incomplete</i>: it does not include cases
+where you submit a PR, see a test failure that is obviously a known
+flake, but re-push your changes to address something else.
+</p>
+<p>
+Flake categorizing is hard. The same flake can show up under many
+different tests (headings). When my time allows, I try to file issues
+and assign flakes into buckets. Mostly, though, it's a jumble.
+</p>
+<hr/>
+END_HTML
+
+    my $_by_timestamp = sub {
+        $by_flake{$b}{_timestamp} <=> $by_flake{$a}{_timestamp}
+                                  ||
+            $by_flake{$b}{_count} <=> $by_flake{$a}{_count}
+                                  ||
+            $a cmp $b;
+    };
+
+    my $counter = '000';
+    my @seen;
+    for my $flake (sort $_by_timestamp keys(%by_flake)) {
+        my $t = localtime($by_flake{$flake}{_timestamp}/1000)->strftime("%m-%d");
+        my $c = $by_flake{$flake}{_count};
+
+        my $title = "$t $flake";
+
+        @seen = ();
+
+        my $bar_css = '';
+        #               123       3  2 4   41
+        if ($flake =~ /^((([\w_-]+)\/)?(\d+))$/) {
+            my $issue        = $1;                      # full issue, may be "buildah/12345"
+            my $issue_number = $4;                      # only the issue number
+            my $project      = $3 || $Project;
+
+            my ($desc, $state) = issue_info($project, $issue_number);
+            $title = sprintf("%s <a href=\"https://github.com/containers/$project/issues/%d\" target=\"_blank\">#%s - %s</a>",
+                             $t, $issue_number, $issue, $desc);
+            $bar_css = " $state";
+            $bar_css = " $desc" if $issue =~ /^9+$/;
+            $title .= " [$state]" if $state ne 'OPEN';
+        }
+
+        print { $out } <<"END_NEW_FLAKE";
+<div class="wrap-collabsible">
+  <input id="collapsible$counter" class="toggle" type="checkbox">
+  <label for="collapsible$counter" class="lbl-toggle $bar_css">$title ($c)</label>
+  <div class="collapsible-content">
+    <div class="content-inner">
+END_NEW_FLAKE
+        print           "\n\n", color('rgb050'), "### ", $flake, color('reset'), "\n"
+            if $markdown;
+        ++$counter;
+
+        # For deduplicating on filed-issue flakes
+        my $prior_flakename = '';
+
+        for my $testname (sort keys %{$by_flake{$flake}}) {
+            next if $testname =~ /^_/;          # skip _timestamp
+
+            my $bump_seen = sub {
+                my $i = 0;
+                for my $token (split ' ', $testname) {
+                    $seen[$i++]{$token}++;
+                }
+            };
+
+            print { $out } " <h3>$testname</h3>\n";
+            print          color('rgb530'), "* $testname", color('reset'),"\n"
+                if $markdown;
+
+            for my $pr (reverse sort keys %{$by_flake{$flake}{$testname}}) {
+                print { $out } "  <h4>PR <a href='https://github.com/containers/$Project/pull/$pr'>#$pr</a></h4>\n";
+                print { $out } "  <table class='flakelist'>\n";
+
+                unless ($pr == 17831) { # hammer-sqlite PR
+                    print          "  * PR #", color('rgb115'), $pr, color('reset'), "\n"
+                        if $markdown;
+                }
+
+                my ($last_md, $last_hm) = ('', '');   # previous MMDD, HHMM
+                for my $instance (@{$by_flake{$flake}{$testname}{$pr}}) {
+                    $bump_seen->();
+
+                    my $t = localtime($instance->{timestamp}/1000);
+                    my $md = $t->strftime("%m-%d");
+                    my $hm = $t->strftime("%H:%M");
+
+                    print  { $out } "   <tr";
+                    if ($t < time - 28 * 86400) {
+                        print { $out } " class='ancient'";      # > 4 weeks
+                        $md .= $t->strftime("-%Y");
+                    }
+                    elsif ($t < time - 14 * 86400) {
+                        print { $out } " class='old'";          # > 2 weeks
+                    }
+                    elsif ($t < time - 5 * 86400) {
+                        ;
+                    }
+                    else {
+                        print { $out } " class='new'";          # < 5 days
+                    }
+                    print  { $out } "><td>";
+                    print  { $out } ($md eq $last_md ? '"' : $md);
+                    print  { $out } "</td><td";
+                    if (my $id = $instance->{id}) {
+                        print  { $out } " title='$id'";
+                    }
+                    print  { $out } ">";
+                    print  { $out } ($hm eq $last_hm ? '"' : $hm);
+                    print  { $out } "</td><td>";
+                    # FIXME: image, testname, subtest should all be the same
+                    print  { $out } "<a href='$instance->{log}' target='_blank'>log</a>";
+                    print  { $out } "</td>";
+                    if (my $flakename = $instance->{flake_orig}) {
+                        # FIXME: escapeHTML!
+                        # if same as previous one, just do " "
+                        $flakename =~ s/(\[sys\]\s+)\d{3}\s/$1/;
+                        if ($flakename eq $prior_flakename) {
+                            $flakename = '  "  "  "  "  "';
+                        }
+                        else {
+                            $prior_flakename = $flakename;
+                        }
+                        printf { $out } "<td>%s</td>", $flakename;
+                    }
+                    print  { $out } "</tr>\n";
+
+                    if ($markdown) {
+                        print "    * [$md $hm]($instance->{log})";
+                        if (my $flakename = $instance->{flake_orig}) {
+                            print " in $flakename";
+                        }
+                        print "\n";
+                    }
+                    $last_md = $md;
+                    $last_hm = $hm;
+                }
+                print { $out } "  </table>\n";
+            }
+        }
+
+        print { $out } "<br/>\n<table class=\"seen-in\"><tr><th>Seen in:</th>";
+        pop @seen if $seen[-1]{"[remote]"};
+        for my $i (2 .. $#seen) {
+            my @keys = sort { $seen[$i]{$b} <=> $seen[$i]{$a} || $a cmp $b } keys %{$seen[$i]};
+            printf { $out } "<td>%s</td>", join("<br/>", map { "$_ <small>($seen[$i]{$_})</small>" } @keys);
+        }
+        print { $out } "</tr></table>\n";
+
+        print { $out } "    </div>\n  </div>\n</div>\n<hr/>\n";
+    }
+
+    printf { $out } <<"END_HTML", localtime->datetime;
+Generated: %s US Eastern Time
+</body>
+</html>
+END_HTML
+
+    close $out
+        or die "$ME: Error writing $html_tmp: $!\n";
+    chmod 0444, $html_tmp;
+
+    # I only use --filter in combination with copy/paste to a github issue.
+    # Please don't rewrite the HTML, that just means I need to re-rewrite it.
+    if ($Filter) {
+        unlink $html_tmp;
+
+        if (@seen) {
+            # FIXME: does this '[remote]' string still help us?
+            pop @seen if $seen[-1]{"[remote]"};
+
+            # Reorder into a markdown table.
+            # Start at 2, to ignore 'fedora-38 :' prefix
+            my @mdtable;
+            my $nrows = -1;
+            for my $col (2 .. $#seen) {
+                my @keys = sort { $seen[$col]{$b} <=> $seen[$col]{$a} } keys %{$seen[$col]};
+                $nrows = $#keys if $nrows < $#keys;
+                for my $row (0 .. $#keys) {
+                    my $k = $keys[$row];
+                    $mdtable[$row][$col] = "$k($seen[$col]{$k})";
+                }
+            }
+
+            print "\n";
+            print "| x "                for 2 .. $#seen;
+            print "|\n";
+            print "| ---: "             for 2 .. $#seen;
+            print "|\n";
+            for my $row (0 .. $nrows) {
+                for my $col (2 .. $#seen) {
+                    printf "| %s ", $mdtable[$row][$col] || '';
+                }
+                print "|\n";
+            }
+        }
+    }
+    else {
+        rename $html_tmp => $html_file
+            or die "$ME: Could not rename $html_tmp: $!\n";
+    }
+}
+
+################
+#  issue_info  #  Given a github issue, return its title and state
+################
+sub issue_info {
+    my $project = shift;
+    my $issue   = shift;
+
+    return ('PLACEHOLDER', 'OPEN') if $issue =~ /^9999\d+$/;
+
+    # Moved to crun or conmon or something else
+    return ($issue, 'MIGRATED') if $issue eq '18472';
+
+    my $ua = LWP::UserAgent->new;
+    $ua->agent("$ME " . $ua->agent);              # Identify ourself
+
+    my $token = $ENV{GITHUB_TOKEN}
+        or die "$ME: Please set \$GITHUB_TOKEN\n";
+
+    my %headers = (
+        'Authorization' => "bearer $token",
+        'Accept'        => "application/vnd.github.antiope-preview+json",
+        'Content-Type'  => "application/json",
+    );
+    $ua->default_header($_ => $headers{$_}) for keys %headers;
+
+    my $query = <<"END_QUERY";
+query {
+  repository(owner:"containers", name:"$project") {
+    issueOrPullRequest(number:$issue) {
+      ... on Issue {
+         __typename
+         title
+         state
+      }
+      ... on PullRequest {
+         __typename
+         title
+         state
+      }
+    }
+  }
+}
+END_QUERY
+
+    # Escape quotes
+    $query =~ s/\"/\\"/g; $query =~ s/\n/ /g; $query =~ s/\s+/ /g;
+    my $postquery = qq/{ "query": "$query" }/;
+
+    my $res = $ua->post('https://api.github.com/graphql',
+                        Content => $postquery);
+    if ((my $code = $res->code) != 200) {
+        use Term::ANSIColor qw(:constants);
+        printf "%s%03d%s", ($code < 400 ? YELLOW : RED), $code, RESET;
+        use Data::Dumper; print Dumper($res);
+        exit 1;
+    }
+
+    my $content = decode_json($res->content)
+        or die "$ME: Got nothing from $query";
+
+#    use Data::Dump; dd $content;
+    my $value = $content;
+    for my $field (qw(data repository issueOrPullRequest)) {
+        $value = $value->{$field}
+            or do {
+                # E.g., #18472 which Giuseppe moved to crun
+                print "\n";
+                use Data::Dump; dd $content;
+                warn "$ME: Could not get '$field'";
+                return ("Unknown issue $issue", "OPEN");
+            };
+    }
+
+    return ($value->{title}, $value->{state});
+}
+
+
+
+
+
+
+
+
+1;
+
+__DATA__
+
+###############################################################################
+#
+# Documentation
+#
+
+=head1	NAME
+
+FIXME - description of what this script does
+
+=head1	SYNOPSIS
+
+FIXME [B<--foo>]  [B<--bar>]  [B<--verbose>] ARG1 [ARG2...] FIXME
+
+FIXME  B<--help>  |  B<--version> | B<--man>
+
+=head1	DESCRIPTION
+
+B<FIXME> grobbles the frobniz on alternate Tuesdays, except where
+prohibited by law.
+
+=head1	OPTIONS
+
+=over 4
+
+=item B<--foo>
+
+FIXME
+
+=item B<--verbose>
+
+Show progress messages.
+
+=item B<--help>
+
+Emit usage hints.
+
+=item B<--version>
+
+Display program version.
+
+=item B<--man>
+
+Display this man page.
+
+=back
+
+
+=head1	DIAGNOSTICS
+
+FIXME
+
+=head1	ENVIRONMENT
+
+FIXME
+
+=head1	FILES
+
+FIXME
+
+=head1	RESTRICTIONS
+
+FIXME
+
+=head1	SEE ALSO
+
+FIXME
+
+e.g. L<Foo::Bar|Foo::Bar>
+
+=head1	AUTHOR
+
+Your Name <ed@edsantiago.com>
+
+Please report bugs or suggestions to <ed@edsantiago.com>
+
+=cut

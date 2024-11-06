@@ -1,0 +1,996 @@
+#!/usr/bin/perl
+#
+# cirrus-flake-summarize - fetch Cirrus logs for a build, summarize flakes
+#
+# $Id: cirrus-flake-summarize,v 1.83 2024/08/01 18:19:15 esm Exp esm $
+#
+package LibPod::CirrusFlakeSummarize;
+
+use v5.14;
+use utf8;
+use open qw( :encoding(UTF-8) :std );
+
+use strict;
+use warnings;
+
+(our $ME = $0) =~ s|.*/||;
+(our $VERSION = '$Revision: 1.83 $ ') =~ tr/[0-9].//cd;
+
+# For debugging, show data structures using DumpTree($var)
+use Data::TreeDumper; $Data::TreeDumper::Displayaddress = 0;
+
+use DBI;
+use JSON;
+use LWP::UserAgent;
+use Term::ANSIColor             qw(:constants color);
+use Time::Piece;
+
+my $ua = new LWP::UserAgent();
+$ua->agent("$ME " . $ua->agent);              # Identify ourself
+
+###############################################################################
+# BEGIN user-customizable section
+
+our $Base_Dir = "/home/esm/.local/share/cirrus-flake-summarize";
+
+our $Project = 'podman';
+
+our $API_URL = 'https://api.cirrus-ci.com/graphql';
+
+our $Log_URL = 'https://api.cirrus-ci.com/v1/task/%s/logs/%s.log';
+
+our $Query = <<'END_QUERY';
+{
+  "query": "query BuildByID($id: ID!) {
+    build(id: $id) {
+      id, status,tasks {
+        id,name,labels,status,finalStatusTimestamp,commands {
+          name,type,status
+        },notifications { level, message }
+      }
+    }
+  }",
+  "variables": {
+    "id": "%s"
+  }
+}
+END_QUERY
+
+# FIXME: making these globals is a kludge
+our $PR;
+our $DB;
+our $DBH;
+
+# CSS for colorizing task names; from github-ci-highlight.user.js
+our $Task_CSS = <<'END_CSS';
+.ci-bud       { padding: 0px 2px; background: #fc0; color: #000; }
+.ci-int       { padding: 0px 2px; background: #960; }
+.ci-sys       { padding: 0px 2px; background: #cf9; }
+.ci-podman    { padding: 0px 2px; }
+.ci-remote    { padding: 0px 2px; background: #f9f; }
+.ci-fedora    { padding: 0px 2px; background: #294172; color: #adf; }
+.ci-ubuntu    { padding: 0px 2px; background: #e95420; color: #fff; }
+.ci-root      { padding: 0px 2px; }
+.ci-rootless  { padding: 0px 2px; background: #ccc; color: #333; }
+.ci-host      { padding: 0px 2px; }
+.ci-container { padding: 0px 2px; background: #9cf; }
+.ci-APIv2     { padding: 0px 2px; background: #c0c; color: #fff; }
+.ci-Unit      { padding: 0px 2px; background: #f99; }
+.ci-Upgrade   { padding: 0px 2px; color: #f0c; }
+END_CSS
+
+# END   user-customizable section
+###############################################################################
+
+###############################################################################
+# BEGIN boilerplate args checking, usage messages
+
+sub usage {
+    print  <<"END_USAGE";
+Usage: $ME [OPTIONS] CIRRUS-JOB-ID
+
+blah blah blah
+
+OPTIONS:
+
+  --buildah      look up a buildah PR
+  --skopeo       look up a skopeo PR
+
+  -v, --verbose  show verbose progress indicators
+  -n, --dry-run  make no actual changes
+
+  --help         display this message
+  --man          display program man page
+  --version      display program name and version
+END_USAGE
+
+    exit;
+}
+
+sub man {
+    # Read the POD contents.  If it hasn't been filled in yet, abort.
+    my $pod = do { local $/; <DATA>; };
+    if ($pod =~ /=head1 \s+ NAME \s+ FIXME/xm) {
+        warn "$ME: No man page available.  Please try $ME --help\n";
+        exit;
+    }
+
+    # Use Pod::Man to convert our __DATA__ section to *roff
+    eval { require Pod::Man }
+        or die "$ME: Cannot generate man page; Pod::Man unavailable: $@\n";
+    my $parser = Pod::Man->new(name => $ME, release => $VERSION, section => 1);
+
+    # If called without output redirection, man-ify.
+    my $out_fh;
+    if (-t *STDOUT) {
+        my $pager = $ENV{MANPAGER} || $ENV{PAGER} || 'less';
+        open $out_fh, "| nroff -man | $pager";
+    }
+    else {
+        open $out_fh, '>&STDOUT';
+    }
+
+    # Read the POD contents, and have Pod::Man read from fake filehandle.
+    # This requires 5.8.0.
+    open my $pod_handle, '<', \$pod;
+    $parser->parse_from_filehandle($pod_handle, $out_fh);
+    exit;
+}
+
+
+# Command-line options.  Note that this operates directly on @ARGV !
+our $debug   = 0;
+our $force   = 0;
+our $verbose = 0;
+our $NOT     = '';              # print "blahing the blah$NOT\n" if $debug
+sub handle_opts {
+    use Getopt::Long;
+    GetOptions(
+        'project=s'  => \$Project,
+        'buildah'    => sub { $Project = 'buildah' },
+        'skopeo'     => sub { $Project = 'skopeo' },
+
+        # When called with a build ID, e.g., for nightly cron jobs
+        'PR=i'       => \$PR,
+
+        'debug:i'    => \$debug,
+        'dry-run|n!' => sub { $NOT = ' [NOT]' },
+        'force'      => \$force,
+        'verbose|v'  => \$verbose,
+
+        help         => \&usage,
+        man          => \&man,
+        version      => sub { print "$ME version $VERSION\n"; exit 0 },
+    ) or die "Try `$ME --help' for help\n";
+}
+
+# END   boilerplate args checking, usage messages
+###############################################################################
+
+############################## CODE BEGINS HERE ###############################
+
+# The term is "modulino".
+__PACKAGE__->main()                                     unless caller();
+
+# Main code.
+sub main {
+    # Note that we operate directly on @ARGV, not on function parameters.
+    # This is deliberate: it's because Getopt::Long only operates on @ARGV
+    # and there's no clean way to make it use @_.
+    handle_opts();                      # will set package globals
+
+    # Fetch command-line arguments.  Barf if too many.
+    my $build_id = shift(@ARGV)
+        or die "$ME: missing BUILD_ID argument; try $ME --help\n";
+    die "$ME: Too many arguments; try $ME --help\n"                 if @ARGV;
+
+    # Might be called with a PR.
+    if ($build_id =~ /^(\d{3,5})$/) {
+        $PR = $1;
+        chomp(my $buildid_tmp = qx{get-cirrus-buildid-for-pr --project=$Project $PR});
+        die "$ME: get-cirrus-buildid-for-pr failed for $PR\n" if $?;
+        $buildid_tmp =~ /^\d{7,}$/
+            or die "$ME: Did not get buildid (got: '$buildid_tmp)'\n";
+        $build_id = $buildid_tmp;
+        # FIXME: preserve PR number, so we can use it in cross-reference
+    }
+
+    # FIXME: do code here
+    doit($build_id);
+}
+
+
+sub doit {
+    my $build_id = shift;
+
+    my @tasks = get_tasks($build_id);
+    my @failures = find_failures(@tasks);
+
+    summarize_failures(@failures)
+}
+
+sub summarize_failures {
+    my $last_testname = '';
+  TASK:
+    for my $task (@_) {
+        if ($task->{name} ne $last_testname) {
+            print "\n" if $last_testname;
+            print '#### ', colorize_taskname($task->{name}), "\n";
+            $last_testname = $task->{name};
+        }
+
+        # 2020-10-01 this handles "CI agent stopped responding!" and
+        # perhaps other failures that leave us without logs.
+        if (my $n = $task->{notifications}) {
+            my @noninfo = grep { $_->{level} ne 'INFO' } @$n;
+            if (@noninfo) {
+                # Flag with '[Cirrus]' to distinguish from flakes in tests
+                my $msg = "[Cirrus] $noninfo[0]{message}";
+
+                # Remove unique crap from cirrus messages, so we can bucketize
+                $msg =~ s/,\s+Request\s+ID:\s+\S+\)/\)/;
+                $msg =~ s/(Failed to (start|stop)): .*$/$1/;
+
+                printf "\n  %s  [%s%s%s](%s)\n",
+                    localtime($task->{finalStatusTimestamp}/1000)->datetime,
+                    color('red'), $task->{failed_command}, color('reset'),
+                    $msg;
+
+                preserve_flake(
+                    pr       => $PR,
+                    image    => $task->{image},          # eg fedora-30
+                    testname => $task->{name},           # eg test fedora-30
+                    subtest  => $task->{failed_command}, # eg integration_test
+                    flake    => $msg,                    # eg agent stopped rsp
+                    taskid   => $task->{id},             # eg 5112116....
+                    timestamp => $task->{finalStatusTimestamp},
+                    log      => '',
+                    remote   => $task->{remote},
+                );
+                next TASK;
+            }
+        }
+
+        # We should have logs now, but sometimes we don't (eg 4712324659412992)
+        my $log_url = sprintf("$Log_URL",$task->{id},$task->{failed_command});
+        printf "\n  %s  [%s%s%s](%s)\n",
+            localtime($task->{finalStatusTimestamp}/1000)->datetime,
+            color('red'), $task->{failed_command}, color('reset'),
+            $log_url;
+
+        my $res = $ua->head($log_url);
+        if ((my $code = $res->code) != 200) {
+            printf STDERR "%s : %s%03d%s", $log_url,
+                ($code < 400 ? YELLOW : RED), $code, RESET;
+            #            exit 1;
+
+            if (my $ref = $task->{failed_ref}) {
+                if ($ref->{status} eq 'ABORTED') {
+                    print STDERR " (expected; reason=ABORTED)\n";
+                }
+                else {
+                    print STDERR " -- reason = $ref->{status}!\n";
+#                print DumpTree($task);
+                }
+            }
+
+            next TASK;
+        }
+        my $l = $res->header("Content-length");
+
+        # Fetch the tail
+        # FIXME: extend to -1500, for TAP tests?
+        $res = $ua->get($log_url);
+        if ((my $code = $res->code) != 200) {
+            printf "%s : %s%03d%s", $log_url,
+                ($code < 400 ? YELLOW : RED), $code, RESET;
+            exit 1;
+        }
+
+        # Do we have an annotated HTMLified log?
+        my $annotated_log = annotated_log($task);
+
+        my $content = $res->content;
+        # Preserve it. $PR is usually an int, but is string for cirrus-cron
+        my $pr_subdir = ($PR =~ /^\d+$/ ? sprintf("%05d", $PR) : $PR);
+        my $log_save_dir = sprintf("$Base_Dir/$Project/logs/%s/%d",
+                                   $pr_subdir, $task->{id});
+        use File::Path qw(make_path);
+        make_path($log_save_dir);
+        my $log_save_file = do {
+            (my $safename = $task->{name}) =~ s|[/\s]+|_|g;
+            "$log_save_dir/$safename";
+        };
+        open my $fh, '>', $log_save_file
+            or die "$ME: Cannot create $log_save_file: $!\n";
+        print { $fh } $content;
+        close $fh
+            or die "$ME: Error writing $log_save_file: $!\n";
+
+        my @flakes = find_flakes($task, $content);
+
+        # Display them
+        my $timestamp = localtime($task->{finalStatusTimestamp}/1000)->datetime;
+        my $previous_fail = '';
+        for my $flake (@flakes) {
+            my ($name, $anchor) = @$flake;
+            my $line_out = '*   ';
+            $line_out .= '[' . color('red')  if $annotated_log;
+            if ($name eq $previous_fail) {
+                $line_out = '  ' . $line_out;   # Indent bullet to make sublist
+                $line_out .= "[same]";
+            }
+            else {
+                $line_out .= $name;
+            }
+
+            my $log_to_preserve = $log_url;     # To save in DB
+            if ($annotated_log) {
+                $log_to_preserve = $annotated_log;
+                $line_out .= color('reset') . "]($log_to_preserve$anchor)";
+            }
+            print $line_out, "\n";
+            $previous_fail = $name;
+
+            # Save it
+            # $name
+            # sql columns:
+            #   image     ($task->{image}, eg fedora-30)
+            #   testname  ($task->{name},  eg test fedora-30)
+            #   subtest   ($task->{failed_command}, eq integration_test)
+            #   flake     ($name,                   eg 'Podman exec [It] ...')
+            #   id        ($task->{id},             eg 5112116461961216)
+            #   timestamp ($task->{finalStatusTimestamp}
+            #   log       ($annotated_log, or perhaps just $log_url)
+            #   PR number!
+            #   https://www.sqlitetutorial.net/sqlite-unique-constraint/
+            if ($PR) {
+                preserve_flake(
+                    pr       => $PR,
+                    image    => $task->{image},          # eg fedora-30
+                    testname => $task->{name},           # eg test fedora-30
+                    subtest  => $task->{failed_command}, # eg integration_test
+                    flake    => $name,                   # eg Podman exec [...
+                    taskid   => $task->{id},             # eg 5112116....
+                    timestamp => $task->{finalStatusTimestamp},
+                    log      => "$log_to_preserve$anchor",
+                    remote   => $task->{remote},
+                );
+            }
+        }
+    }
+}
+
+
+#################
+#  find_flakes  #  Identify the flakes in a log
+#################
+sub find_flakes {
+    my $task    = shift;                # in: HREF with task info
+    my $content = shift;                # in: log file (blob of text)
+
+    my @flakes;
+    my %seen;                           # to prevent python dups
+    my $looks_like    = '';
+    my $after_divider = 999;            # for ginkgo tests: lines after -----
+    my $current_test  = '';             # for ginkgo: current test name
+    my $subtest_status = '';            # ginkgov2: status precedes test name
+
+    (my $test_basename = "[$task->{name}]") =~ s/\s.*\]$/\]/;
+
+    for my $line (split "\n", $content) {
+        chomp $line;
+        $line =~ s/^(\[\+\d+s\]\s)//;   # Strip off leading timestamp
+        $line =~ s/\s+$//;              # Strip trailing whitespace
+
+        my $flakename;              # flake name to show in DB
+        my $anchor = '';            # for linking deep into a log page
+
+        # 2023-02 special case for our monster flakes
+        if ($line =~ /(copying.*manifest.*)?(writing|storing) blob.*happened during read:.* unexpected EOF/) {
+            # This does not necessarily poison the entire run, but it's
+            # likely to be the cause of the most recently seen flake
+            pop @flakes if @flakes;
+            if ($Project eq 'podman') {
+                $flakename = '17193';
+            }
+            else {
+                $flakename = 'happened during read';
+            }
+        }
+        # 2023-12 quay is flaking BADLY
+        elsif ($line =~ /quay\.io.*(talk to a V1 container registry|invalid status code from registry 502|unexpected HTTP status: 502)/) {
+            # Assume that this poisons the rest of the run
+            if ($Project eq 'podman') {
+                return [ '16973', '' ];
+            }
+            return [ 'quay.io flake', '' ];
+        }
+        # 2024-03 these aren't flakes, they're reruns with a new label
+        elsif ($test_basename =~ /validate/i && $line =~ /Please write a regression test/) {
+            print "[ never mind, this is a No New Tests rerun ]\n";
+            return;
+        }
+        # 2024-05-14 machine timeout flake
+        elsif ($test_basename =~ /machine/ && $line =~ /\[FAILED\]\s+Timed out after/) {
+            $flakename = '22551';
+        }
+
+        # BATS or other TAP tests
+        elsif ($line =~ /\bnot ok\s+(\d+)\s+(.*)/) {
+            my ($num, $name) = ($1, $2);
+            $anchor = sprintf("#t--%05d", $num);
+            # July 2024, parallelized system tests
+            $anchor .= 'p' if $name =~ /^\|\d+\|/;
+
+            # strip "bats -T" timing
+            $name =~ s/\s+in\s+\d+ms$//;
+
+            # 2024-08 (maybe temporary??) Do not count "teardown_suite" as a flake
+            # if there are other failures. That just means a failed test did not
+            # clean up after itself, which is expected.
+            unless ($name =~ /teardown_suite/ && @flakes) {
+                # Do not include NNN in flake name: it changes too much.
+                # Do include '[sys]', '[Upgrade]', 'bud'
+                $flakename = "$test_basename $name";
+            }
+
+            $looks_like = 'tap';
+        }
+        elsif ($looks_like eq 'ginkgo') {
+            if ($line =~ /^-----------/) {
+                $after_divider = 1;
+            }
+            elsif ($after_divider++ == 2) {
+                # Sigh. There is no actual marker. Assume that anything with
+                ## two leading spaces then alpha or hyphen (not slashes) is
+                ## a test name.
+                if ($line =~ /^  ([a-zA-Z-].*)/) {
+                    $current_test = $1;
+                }
+            }
+###            elsif ($line =~ /^.{1,3}\sFailure
+            elsif ($line =~ s/^\[(Fail|Panic\!)\]\s+//) {
+                $flakename = $line;
+                if ($flakename =~ /\s\[(It|Before_Each)\]\s+(.*)/) {
+#                    print "*** GOT HERE 00 Fail/Panic/It flake='$flakename'\n";
+                    $anchor = '#' . make_id($2, $task->{id});
+                }
+
+                # Otherwise the flake label might look like plain int tests
+                if ($task->{name} eq 'Test Bindings') {
+                    $flakename = "[Bindings] $flakename";
+                }
+            }
+        }
+
+        elsif ($looks_like eq 'ginkgov2') {
+            if ($line =~ /^-----------/) {
+                $after_divider = 1;
+                $current_test  = '';
+                $subtest_status = 'passed';
+                next;
+            }
+
+            # One line after each divider, there's a status/timing line.
+            if ($after_divider == 1) {
+                if ($line =~ /\[(\d+)\.\d+\s+seconds\]/) {
+
+                    # THIS IS NOT A FLAKE! Except when flake-attempts=0
+                    if ($line =~ /\[(FAILED)\]/) {
+                        $subtest_status = lc($1);
+                    }
+                    if ($line =~ /\[FLAKEY TEST/) {
+                        $subtest_status = 'flaked';
+                    }
+                }
+            }
+
+            # Test name recognition, linking, and highlighting.
+            # The lines after each divider, until the first empty line, are
+            # one or more test name specifiers, a nested level of Description()
+            # and It() names:
+            #    -----------
+            #    * blah [N seconds]     <<<---- only when run with -p
+            #    Podman foo
+            #    /var/tmp/go/src/path/to/this/file.go:lineno
+            #       podman bar
+            #       /var/tmp/go/src/path/to/this/file.go:lineno
+            #
+            # There may even be three nested levels (e.g., quadlet). We
+            # look for non-path lines and assemble them -- "Podman foo",
+            # " Podman foo podman bar" -- giving each an HTML anchor
+            # to which we can link from the summary section at bottom.
+            if ($after_divider <= 10) {      # Assume no more than ~5 levels
+                if ($line =~ /^\s*$/ || $line =~ /^\s*>\s+Enter /) {
+                    # Stop looking when we get to the blank line
+                    # ...or, podman-machine, '> Enter>'
+                    $after_divider = 999;
+                    if ($subtest_status eq 'failed') {
+#                        print "*** GOT HERE 1: Failed int test, detected before enter\n";
+                        $flakename = $current_test;
+                        $anchor = '#' . make_id($current_test, $task->{id});
+                    }
+                }
+                elsif ($line =~ /Running:/) {
+                    # Sigh. Bindings tests run without -p, and have no blank
+                    # line separator. Use the first command to signal real
+                    # logs.
+                    # FIXME: can we solve this with ReportBeforeEach()?
+                    #   https://onsi.github.io/ginkgo/#generating-reports-programmatically
+                    $after_divider = 999;
+                    if ($subtest_status eq 'failed') {
+#                        print "*** GOT HERE 2: bindings-test failure\n";
+                        $flakename = $current_test;
+                        $anchor = '#' . make_id($current_test, $task->{id});
+                    }
+                }
+                elsif ($line =~ m!^\s*(C:)?/\S+!) {
+                    # Source code path: skip
+                }
+###                elsif ($line =~ /^---------/) {
+###                    # sigh skip
+###                }
+                elsif ($line =~ /\d\sseconds/) {
+                    # Already-formatted line (like the "N seconds" one): skip
+                }
+                elsif ($line =~ /^\s*(\[It\]\s*)?(.*)/) {
+                    # Test description or name! Remove "It", and make an anchor
+                    $current_test .= " " if $current_test;
+                    $current_test .= $2;
+                }
+            }
+            else {
+                # ginkgo on podman-machine emits FAILED at end, not beginning
+                if ($line =~ /^\s*\[FAILED\]/ && $line !~ / error logged/) {
+#                    print "*** GOT HERE 3: ginkgo on podman-machine\n";
+                    $subtest_status = 'failed';
+                    # DEDUP: avoid counting this twice
+                    $flakename = $current_test;
+                    if (@flakes && ($flakes[-1][0] eq $flakename)) {
+                        $flakename = '';
+                    }
+                    $anchor = '#' . make_id($current_test, $task->{id})
+                        if $flakename;
+                }
+            }
+
+            ++$after_divider;
+        }
+
+        # e.g. 11252/6253150249156608/Unit_tests_on_fedora-34
+        elsif ($looks_like eq 'ginkgo-nonverbose') {
+            if ($line =~ /^\s{3,}---\s+FAIL:\s+(\S+)/) {
+                $flakename = "$test_basename $1";
+            }
+        }
+
+        elsif ($looks_like eq 'python') {
+            # This seems to be the message if tests run with --verbose?
+            if ($line =~ /\.py::(\S+)::(\S+)\s+FAILED\s+\[/) {
+                $flakename = "$test_basename $1.$2";
+            }
+            elsif ($line =~ /^\s*_{10,}\s+(\S+\.\S+)\s+_{10,}\s*$/) {
+                $flakename = "$test_basename $1";
+            }
+            elsif ($line =~ /^FAIL:\s+(test_\S+)\s+\((\S+)\)/) {
+                $flakename = "$test_basename $2.$1";
+            }
+
+            # When verbose, we don't want to trigger twice on the same test
+            undef $flakename if $flakename && $seen{$flakename}++;
+        }
+
+        elsif ($task->{name} eq 'Optional Release Test') {
+            if ($line =~ /^ERROR: Releases must never contain '-dev' in /) {
+                print "[ never mind, this is the 'version contains -dev' thing ]\n";
+                return;
+            }
+        }
+        elsif ($task->{name} eq 'Build Each Commit') {
+            if ($line =~ /\*\s+(\S+)\s+grew by /) {
+                $flakename = "Bloat check";
+            }
+        }
+
+        # e.g. 17015/4672741614288896/machine*
+        # This is actually ginkgo but it's really hard to identify
+        elsif ($line =~ /^---\s+FAIL:\s+(\S+)\s+\(/) {
+            $flakename = "$test_basename $1";
+        }
+
+        elsif ($line =~ /(\[(BeforeEach|AfterEach)\])|Summarizing\s/) {
+            $looks_like = 'ginkgo';
+        }
+        elsif ($line =~ /Timeline\s+>>|Running Suite:\s.*\s-\s/) {
+            $looks_like = 'ginkgov2';
+        }
+        elsif ($line =~ /^===\s+RUN\s/) {
+            $looks_like = 'ginkgo-nonverbose';          # ??????
+        }
+        elsif ($line =~ /^={10,}\s+test session starts\s+={10,}/) {
+            $looks_like = 'python';
+        }
+        elsif ($line =~ m!/python3?.*unittest!) {
+            $looks_like = 'python';
+        }
+
+        push @flakes, [ $flakename, $anchor ]  if $flakename;
+    }
+
+#    print STDERR "looks-like $looks_like\n";
+
+    if (!@flakes) {
+        my $in = '';
+        if ((my $subtest = $task->{failed_command}) ne 'main') {
+            $in = " in $subtest";
+        }
+        # FIXME: it's possible to have a timeout as well as other flakes
+        if ($content =~ /Timed out\!/) {
+            @flakes = [ "$task->{name}: Timeout$in", "" ];
+        }
+        else {
+            @flakes = [ "$task->{name}: unknown failure$in", '' ];
+        }
+    }
+
+    return @flakes;
+}
+
+
+
+###############################################################################
+# BEGIN sql stuff
+
+sub DBH {
+    $DB = "$Base_Dir/$Project/db.sqlite";
+    $DBH = DBI->connect("dbi:SQLite:dbname=$DB")
+        or die "$ME: Cannot DBI->connect to db: $@";
+
+    $DBH;
+}
+
+sub task_already_logged {
+    my $taskid = shift;
+
+    my $sql = 'SELECT COUNT(*) FROM flakes WHERE taskid=?';
+    my $dbh = DBH();
+    my $sth = $dbh->prepare($sql);
+    $sth->execute($taskid);
+    my $result = $sth->fetchrow_hashref;
+    return $result->{'COUNT(*)'};
+}
+
+####################
+#  preserve_flake  #  Write results to a local DB
+####################
+sub preserve_flake {
+    my %flake = @_;
+
+    return if $NOT;
+
+    my @keys = sort keys %flake;
+    my $sql = sprintf("INSERT INTO flakes (%s) VALUES (%s)",
+                      join(',', @keys),
+                      join(',', ('?') x @keys));
+
+    my $dbh = DBH();
+    $dbh->prepare($sql)->execute(map { $flake{$_} } @keys);
+    my $id = $dbh->last_insert_id("","","","");
+    use Data::Dump; dd $id;
+}
+
+# END  sql stuff
+###############################################################################
+
+sub annotated_log {
+    my $task = shift;
+
+    my $url_base          = "https://api.cirrus-ci.com";
+
+    # 2020-10 new Cirrus v2 with names like "sys podman fedora-31 root host"
+    (my $dashname = $task->{name}) =~ s/\s+/-/g;
+    # 2021-04-20 the compose and upgrade tests have a different name structure
+    $dashname =~ s/^(compose(_v2)?)-test-on-(\S+)-\((root(less)?)\)$/$1-podman-$3-$4-host/;
+    $dashname =~ s/^Upgrade-test:-from-[^-]+/upgrade_test-podman-$task->{image}-root-host/;
+
+    # 2022-02-10 Netavark also:
+    #     Netavark-sys-podman-root
+    #  -> sys-podman-fedora-35-root-host-netavark
+    $dashname =~ s/^Netavark-(\S+)-(\S+)-(\S+)/$1-$2-$task->{image}-$3-host-netavark/;
+#    printf "GOT HERE: dashname='$dashname'\n";
+    my $url = "${url_base}/v1/artifact/task/$task->{id}/html/$dashname.log.html";
+
+    my $res = $ua->head($url);
+    if ($res->code == 200) {
+        return $url;
+    }
+    warn "$ME: Warning: No annotated log: $url\n";
+    return;
+}
+
+#############
+#  make_id  #  Given a test name, generate an anchor link name
+#############
+sub make_id {
+    my $name = shift;                   # in: test title
+    my $type = shift;                   # in: differentiator (anchor, link)
+
+    state %counter;
+
+    $name =~ s/^TOP-LEVEL\s*//;
+    $name =~ s/^\s*\[(Before|After)Each\]\s*//;
+
+    $name =~ s/^\s+|\s+$//g;            # strip leading/trailing whitespace
+    $name =~ s/^\[It\]\s*//;            # strip leading "[It] "
+    $name =~ s/\&#\d+;//g;              # 'doesn&#39;t' -> 'doesnt'
+    $name =~ s/\&quot;/-/g;             # '&quot;path&quot;' -> '-path-'
+    $name =~ s/[^a-zA-Z0-9_-]/-/g;      # Convert non-alphanumeric to dash
+    $name =~ s/-{3,}/-/g;               # '------' to just '-'
+
+    # Keep a running tally of how many times we've seen this identifier
+    # for this given type! This lets us cross-match, in the bottom of
+    # the page, the first/second/third failure of a given test.
+    $name .= "--" . ++$counter{$type}{$name};
+
+    "t--$name";
+}
+
+sub get_tasks {
+    my $build_id = shift;
+
+    my $query = sprintf($Query, $build_id);
+
+    my $res = $ua->post($API_URL, Content => $query);
+    if ((my $code = $res->code) != 200) {
+        use Term::ANSIColor qw(:constants);
+        printf "%s%03d%s", ($code < 400 ? YELLOW : RED), $code, RESET;
+        exit 1;
+    }
+
+    my $content = decode_json($res->content);
+    if ($content->{errors}) {
+        warn "$ME: Cirrus query failed\n";
+        print $query; use Data::Dump; dd $content;
+        exit 1;
+    }
+
+    exists $content->{data}
+        or die "$ME: No '{data}' section in response from Cirrus\n";
+    exists $content->{data}{build}
+        or die "$ME: No '{data}{build}' section in response from Cirrus\n";
+    exists $content->{data}{build}{tasks}
+        or die "$ME: No '{data}{build}{tasks}' section in response from Cirrus\n";
+
+    my @tasks;
+  TASK:
+    for my $t (@{$content->{data}{build}{tasks}}) {
+        if (my $taskid = $t->{id}) {
+            if (task_already_logged($taskid)) {
+                $| = 1;
+                printf "Already logged '%s'! Log it again? (y/N) ", $t->{name};
+                my $ans = <STDIN>;
+                next TASK unless $ans =~ /^y/i;
+            }
+
+            push @tasks, $t;
+        }
+    }
+
+    print DumpTree(\@tasks)     if $debug & 0x100;
+
+    return @tasks;
+}
+
+
+sub find_failures {
+    my @failures;
+#    use Data::Dump; dd \@_;
+  TASK:
+    for my $task (sort _by_name_and_timestamp @_) {
+        # FIXME: Also do this image once it's completed?
+        if ($task->{status} eq 'FAILED') {
+            my $remote = '';
+            if (grep { /PODBIN_NAME:remote/ } @{$task->{labels}}) {
+                $remote = ' [remote]';
+            }
+            $task->{remote} = ($remote ne '');
+
+            # 2021-04-14 ugh
+#            print "GOT HERE $task->{name}\n";
+#            use Data::Dumper; print Dumper($task);
+#            use Data::Dump; dd $task;
+            if ($Project eq 'podman') {
+                $task->{image} = eval { parse_label('DISTRO_NV', delete $task->{labels}) };
+                if ($@) {
+                    warn "$ME: Skipping task $task->{name}: $@\n"
+                        unless $task->{name} eq 'Artifacts';
+                    next TASK;
+                }
+            }
+            else {
+                # FIXME: buildah has no way to get the image (Fedora, Ubuntu)
+                $task->{image} = '[unknown image]';
+            }
+
+            # Shortcut to name of first failed command
+            my @fc = grep { $_->{status} =~ /^(FAILURE|ABORTED)$/ } @{$task->{commands}};
+            $task->{failed_command} = 'UNKNOWN';
+            if (@fc) {
+                $task->{failed_command} = $fc[0]{name};
+                $task->{failed_ref}     = $fc[0];
+            }
+            elsif ($debug) {
+                warn "$ME: Did not find 'status=FAILURE' in task->commands:\n";
+                print DumpTree($task);
+            }
+
+            push @failures, $task;
+
+        }
+    }
+
+    print DumpTree(\@failures)     if $debug & 0x80;
+
+    return @failures;
+}
+
+#################
+#  parse_label  #  Find and parse the value of an envariable
+#################
+sub parse_label {
+    my $want  = shift;                  # in: probably 'DISTRO_NV'
+    my $ahref = shift;                  # in: array or hashref
+
+    # First: convert to hash
+    my $href;
+    if (ref($ahref) eq 'HASH') {
+        $href = $ahref;
+    }
+    else {
+        $href = {};
+        for my $k (@$ahref) {
+            $k =~ /^(.*?):(.*)$/
+                or die "$ME: label '$k' is not 'FOO:bar'!";
+            $href->{$1} = $2;
+        }
+    }
+
+    my $value = $href->{$want}
+        or die "$ME: Did not find '$want' in labels";
+    $value =~ s/\$\{(\S+?)\}/parse_label($1,$href)/ge;
+
+    $value;
+}
+
+sub _by_name_and_timestamp {
+    $a->{name} cmp $b->{name} ||
+        $a->{finalStatusTimestamp} <=> $b->{finalStatusTimestamp};
+}
+
+###############################################################################
+# BEGIN color helpers
+
+our %task_color;
+sub _initialize_task_color_map {
+    return if keys %task_color;
+
+    for my $line (split "\n", $Task_CSS) {
+        $line =~ s/^\.ci-(\S+)\s+// or die;
+        my $substring = $1;
+        $task_color{$substring} = '';
+        if ($line =~ /color:\s+\#(...);/) {
+            my $rgb = _translate_rgb($1);
+            $task_color{$substring} .= color("$rgb");
+        }
+        if ($line =~ /background:\s+\#(...);/) {
+            my $rgb = _translate_rgb($1);
+            $task_color{$substring} .= color("on_$rgb");
+        }
+    }
+}
+
+# Translate XXX (for X in 0..F) to NNN (0..5)
+sub _translate_rgb {
+    my @rgb = map { sprintf("%d", 5.0 * hex($_) / 15) } split('', shift);
+    return "rgb" . join('', @rgb);
+}
+
+sub colorize_taskname {
+    my $task = shift;
+
+    _initialize_task_color_map();
+
+    my @tokens = split ' ', $task;
+    for my $t (@tokens) {
+        if (my $rgb = $task_color{$t}) {
+            $t = $rgb . $t . color('reset');
+        }
+        elsif ($t =~ /^(fedora|ubuntu)-/) {
+            $t = $task_color{$1} . $t . color('reset');
+        }
+    }
+
+    return join(' ', @tokens);
+}
+
+1;
+
+__DATA__
+
+###############################################################################
+#
+# Documentation
+#
+
+=head1	NAME
+
+FIXME - description of what this script does
+
+=head1	SYNOPSIS
+
+FIXME [B<--foo>]  [B<--bar>]  [B<--verbose>] ARG1 [ARG2...] FIXME
+
+FIXME  B<--help>  |  B<--version> | B<--man>
+
+=head1	DESCRIPTION
+
+B<FIXME> grobbles the frobniz on alternate Tuesdays, except where
+prohibited by law.
+
+=head1	OPTIONS
+
+=over 4
+
+=item B<--foo>
+
+FIXME
+
+=item B<--verbose>
+
+Show progress messages.
+
+=item B<--help>
+
+Emit usage hints.
+
+=item B<--version>
+
+Display program version.
+
+=item B<--man>
+
+Display this man page.
+
+=back
+
+
+=head1	DIAGNOSTICS
+
+FIXME
+
+=head1	ENVIRONMENT
+
+FIXME
+
+=head1	FILES
+
+FIXME
+
+=head1	RESTRICTIONS
+
+FIXME
+
+=head1	SEE ALSO
+
+FIXME
+
+e.g. L<Foo::Bar|Foo::Bar>
+
+=head1	AUTHOR
+
+Your Name <ed@edsantiago.com>
+
+Please report bugs or suggestions to <ed@edsantiago.com>
+
+=cut
