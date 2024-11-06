@@ -1,0 +1,489 @@
+#!/usr/bin/perl
+#
+# cirrus-vm-get-versions - from a VM email, find package versions
+#
+package ESM::CirrusVmGetVersions;
+
+use v5.14;
+use utf8;
+use open qw( :encoding(UTF-8) :std );
+
+use strict;
+use warnings;
+
+(our $ME = $0) =~ s|.*/||;
+(our $VERSION = '$Revision: 1.35 $ ') =~ tr/[0-9].//cd;
+
+# For debugging, show data structures using DumpTree($var)
+#use Data::TreeDumper; $Data::TreeDumper::Displayaddress = 0;
+
+###############################################################################
+# BEGIN user-customizable section
+
+# The images we want. This may change infrequently.
+our @Images_Wanted = qw(debian prior-fedora fedora fedora-aws rawhide);
+
+# The package versions we want.
+our @Packages_Wanted = qw(
+    base
+    kernel
+    grub2-common
+    aardvark-dns
+    netavark
+    buildah
+    conmon
+    container-selinux
+    containers-common
+    criu
+    crun
+    docker-ce
+    golang
+    gvisor-tap-vsock
+    nmap-ncat
+    passt
+    podman
+    runc
+    skopeo
+    slirp4netns
+    systemd
+    tar
+);
+
+# END   user-customizable section
+###############################################################################
+
+use File::Slurp;
+use LWP::Simple;
+
+###############################################################################
+# BEGIN boilerplate args checking, usage messages
+
+sub usage {
+    print  <<"END_USAGE";
+Usage: show MESSAGE | $ME [OPTIONS]
+
+Creates a version table for posting in an automation_images PR
+
+MESSAGE is a path to an MH file: ~/Mail/A/linux/123
+
+OPTIONS:
+
+  --baseline=X   compare to baseline X (YYYYMMDD....)
+
+  --across       show distro columns, package rows (default)
+  --across!      show package columns, distro rows (obsolescent)
+
+  -v, --verbose  show verbose progress indicators
+  -n, --dry-run  make no actual changes
+
+  --help         display this message
+  --version      display program name and version
+END_USAGE
+
+    exit;
+}
+
+# Command-line options.  Note that this operates directly on @ARGV !
+our $across = 1;
+our $Baseline;
+our $Skip_Empty_Diffs;
+our $debug   = 0;
+our $force   = 0;
+our $verbose = 0;
+our $NOT     = '';              # print "blahing the blah$NOT\n" if $debug
+sub handle_opts {
+    use Getopt::Long;
+    GetOptions(
+        'across!'    => \$across,
+        'baseline=s' => \$Baseline,
+        'skip-empty-diffs!' => \$Skip_Empty_Diffs,
+
+        'debug!'     => \$debug,
+        'dry-run|n!' => sub { $NOT = ' [NOT]' },
+        'force'      => \$force,
+        'verbose|v'  => \$verbose,
+
+        help         => \&usage,
+        version      => sub { print "$ME version $VERSION\n"; exit 0 },
+    ) or die "Try `$ME --help' for help\n";
+}
+
+# END   boilerplate args checking, usage messages
+###############################################################################
+
+############################## CODE BEGINS HERE ###############################
+
+# The term is "modulino".
+__PACKAGE__->main()                                     unless caller();
+
+# Main code.
+sub main {
+    # Note that we operate directly on @ARGV, not on function parameters.
+    # This is deliberate: it's because Getopt::Long only operates on @ARGV
+    # and there's no clean way to make it use @_.
+    handle_opts();                      # will set package globals
+
+    # We take no args
+    my $file1 = shift(@ARGV)
+        or die "$ME: missing FILE1 argument; see $ME --help\n";
+    die "$ME: Too many arguments; try $ME --help\n"                 if @ARGV;
+
+    # Prevent incompatible args
+    if ($Skip_Empty_Diffs && !$Baseline) {
+        die "$ME: --skip-empty-diffs is meaningless without --baseline\n";
+    }
+
+    my $versions = get_versions($file1);
+
+    if ($Baseline) {
+        my $baseline_versions = get_versions($Baseline);
+
+        display($versions, $baseline_versions);
+    }
+    else {
+        display($versions);
+    }
+}
+
+
+##################
+#  get_versions  #  returns a hashref with versions
+##################
+sub get_versions {
+    my $file_or_sfx = shift;            # in: path to MH file, or IMG_SFX
+
+    my $cachedir;
+
+    if ($file_or_sfx =~ m!^c?(\d{8}\S*)$!) {
+        $cachedir = cachedir($1);
+        -d $cachedir
+            or die "$ME: No cachedir: $cachedir\n";
+    }
+    elsif ($file_or_sfx =~ m!/Mail/(\S+)/(\d+)$!) {
+        my ($folder, $n) = ($1, $2);
+        $cachedir = fetch_logs($folder, $n);
+    }
+    else {
+        die "$ME: malformed input file '$file_or_sfx', must be ~/Mail/folder/N";
+    }
+
+
+    # extract versions from each log file
+    my %version_on_vm;
+    ($version_on_vm{_img_sfx} = $cachedir) =~ s|^.*/||;
+
+    for my $type (qw(base cache)) {
+      DISTRO:
+        for my $distro (@Images_Wanted) {
+            # Cache must exist, except for rawhide base
+            my $cachefile = "$cachedir/$distro.$type";
+            if (! -e $cachefile) {
+                if ($distro eq 'rawhide' && $type eq 'base') {
+                    next DISTRO;
+                }
+                die "$ME: No cachefile: $cachefile";
+            }
+            my $content = read_file($cachefile, { binmode => ':utf8' });
+            my %version;
+            my $in_package_list;
+            for my $line (split "\n", $content) {
+                # Strip ANSI escape sequences
+                $line =~ s/\e\[[\d;]*m//g;
+                $line =~ s/\e\(B//g;
+                # Strip the name prefix
+                $line =~ s/^\s*(=+>\s+)?$distro: //;
+
+                if ($line =~ /\sPackage\s+(\S+)-(\S+-\S+)\..* is already inst/) {
+                    $version{$1} = $2;
+                }
+                elsif ($line =~ /^\s+(\S+)\s+\S+\s+(\S+-\S+)\.\S+\s+\S+\s/) {
+                    my ($package, $version) = ($1, $2);
+                    $package = 'base' if $package eq 'fedora-release-common';
+                    $version =~ s/^\S+://;              # strip epoch
+                    $version{$package} = $version;
+                }
+                # Debian
+                elsif ($line =~ /^\s*Setting up (\S+)\s+\((\S+)\)\s+\.\.\./) {
+                    my ($package, $version) = ($1, $2);
+                    # Strip off arch
+                    $package =~ s/:amd64$//;
+                    # Special case package name. LHS=fedora-name, RHS=debian
+                    $package = 'base'        if $package eq 'base-files';
+                    $package = 'golang'      if $package eq 'golang-go';
+                    $package = 'nmap-ncat'   if $package eq 'ncat';
+                    $version{$package} = $version;
+                }
+                # Special case for docker on debian, used in Buildah conformance
+                elsif ($line =~ /^\s*Get:\d+.*download\.docker\.com.*\s(docker-ce)\s\S+\s(\S+)\s/) {
+                    $version{$1} = $2;
+                }
+                # Special case for non-rawhide Fedora
+                elsif ($line =~ /^Trying.*Fedora-Cloud-Base-(\S+?)\.x86/) {
+                    $version{base} = $1;
+                }
+
+                # 2024-02-07 Ed added 'rpm -qa' and 'dpkg -l' output
+                elsif ($line =~ /#\s+PACKAGE\s+LIST/) {
+                    $in_package_list = 1;
+                }
+                elsif ($in_package_list) {
+                    my ($pkg, $v);
+                    if ($line =~ /^(\S+)-(\S+-\S+)\.fc\d+\./) {
+                        ($pkg, $v) = ($1, $2);
+                        $pkg = 'kernel' if $pkg eq 'kernel-core';
+                    }
+                    # dpkg -l
+                    elsif ($line =~ /^[hi]i\s+(\S+)\s+(\S+)/) {
+                        ($pkg, $v) = ($1, $2);
+                        $pkg = 'kernel' if $pkg =~ /^linux-image/;
+                    }
+
+                    if ($pkg) {
+                        # Don't warn. Too noisy because epoch differs,
+                        # or dash-extensions. Just trust this one.
+#                        if ($version{$pkg} && $version{$pkg} !~ /$v/) {
+#                            warn "$ME: Overriding $distro $pkg: $version{$pkg} -> $v\n";
+#                        }
+                        $version{$pkg} = $v;
+                    }
+                }
+            }
+
+            for my $p (@Packages_Wanted) {
+                if (defined (my $v = $version{$p})) {
+                    # Special case: trim super-long pasta version strings
+                    if ($p eq 'passt' && $across) {
+                        #$v =~ s/^[0.^~]+//;
+                        #$v =~ s/^git//;
+                        #$v =~ s/\.g?[0-9a-f]{6,}-\d$//;
+                        if ($v =~ /\D(20\d\d)(\d\d)(\d\d)\D/) {
+                            $v = "$1-$2-$3";
+                        }
+                    }
+                    $version_on_vm{$p}{$distro} = $v;
+                }
+            }
+        }
+    }
+
+    return \%version_on_vm;
+}
+
+################
+#  fetch_logs  #  Given an MH folder and message number, fetch the logs
+################
+sub fetch_logs {
+    my ($folder, $n) = @_;
+
+    #
+    # Pass 1: read the mail file, to get the PR
+    #
+    my $pr;
+    open my $fh, '<', "$ENV{HOME}/Mail/$folder/$n"
+        or die "$ME: Cannot read $folder $n: $!";
+    while (my $line = <$fh>) {
+        if ($line =~ m!^Message-ID:.*images/pull/(\d+)!) {
+            $pr = $1;
+        }
+    }
+    close $fh
+        or die "$ME: Error reading $folder $n: $!";
+    defined $pr
+        or die "$ME: Did not find PR number in $folder $n\n";
+
+    #
+    # Pass 2: read formatted email, extract relevant details from it
+    #
+    my $cachedir;
+    my %task;
+    my @taskid;
+    # FIXME: maybe also read 'build' lines, to get systemd version?
+
+    my @cmd = ('show', -width => '999', "+$folder", $n);
+    open my $mh, '-|', @cmd
+        or die "$ME: Cannot fork: $!";
+    while (my $line = <$mh>) {
+        # Line from table
+        #                 1          1     2   2  3   3
+        if ($line =~ /^\s+(base|cache)\s+\[(\d+)\](\S+)/) {
+            $task{$3}{$1} = $2;
+
+            if ($line =~ /\s+c(\d+t\d+z-\S+)\s*$/) {
+                $cachedir = cachedir($1);
+                mkdir $cachedir, 02755 if ! -d $cachedir;
+                if (! -l "$cachedir/.pr") {
+                    symlink $pr, "$cachedir/.pr"
+                        or die "$ME: symlink $cachedir/.pr -> $pr: $!";
+                }
+            }
+        }
+
+        # Link
+        elsif ($line =~ m!^\s+(\d+)\.\s+http\S+/task/(\d+)!) {
+            $taskid[$1] = $2;
+        }
+
+        # PR number from subject line
+        elsif ($line =~ m!^Subject.*\(PR\s+\#(\d+)\)!) {
+            $pr = $1;
+        }
+    }
+    close $mh
+        or die "$ME: Error running @cmd";
+
+    # Pass 2: fetch all logs
+    for my $distro (sort keys %task) {
+        for my $type (sort keys %{$task{$distro}}) {
+            my $cachefile = "$cachedir/$distro.$type";
+            next if -e $cachefile;
+
+            my $index = $task{$distro}{$type};
+            defined $taskid[$index]
+                or die "$ME: Internal error: index '$index' undefined";
+
+            my $url = sprintf("https://api.cirrus-ci.com/v1/task/%d/logs/main.log",
+                              $taskid[$index]);
+
+            my $content = get($url)
+                or die "$ME: Could not fetch $url\n";
+            write_file($cachefile, { binmode => ':utf8' }, $content);
+        }
+    }
+
+    die "$ME: did not find any ' cache [NN]xxxx c2023xxxx' lines\n"
+        if ! keys %task;
+
+    return $cachedir;
+}
+
+
+##############
+#  cachedir  #  cache dir for a given suffix
+##############
+sub cachedir {
+    my $img_sfx = shift;                        # in: YYYYMMDD(tHHMMSSz-etc)?
+
+    my $basedir = "$ENV{HOME}/.cache/$ME";
+
+    # Called with a complete string (date, time, distros)? Just return it.
+    # Do not check for existence: there's one case where our caller mkdirs.
+    if ($img_sfx =~ /^(\d{8}t\d{6}z-\w+)$/) {
+        return "$basedir/$1";
+    }
+
+    # Incomplete string. Try globbing.
+    opendir my $dir_fh, $basedir
+        or die "$ME: opendir $basedir: $!\n";
+    my @match = sort grep { /^$img_sfx/ } readdir $dir_fh;
+    closedir $dir_fh;
+
+    die "$ME: No match for '$img_sfx' in $basedir\n"    if ! @match;
+
+    return "$basedir/$match[0]"                         if @match == 1;
+
+    warn "$ME: '$img_sfx' is ambiguous; matches:\n";
+    warn "    $_\n"   for @match;
+    exit 1;
+}
+
+
+#############
+#  display  #  Show versions in a table.
+#############
+sub display {
+    my $new_version = shift;
+    my $old_version = shift;            # optional
+
+    if ($old_version) {
+        my $ov = $old_version->{_img_sfx};
+        my $nv = $new_version->{_img_sfx};
+        if ($ov gt $nv) {
+            die "$ME: FATAL: baseline $ov is newer than $nv\n";
+        }
+
+        # FIXME: split into YMD, HMS, distros?
+        # FIXME: highlight the YMD or HMS diff?
+        # FIXME: show this in a table?
+        print "- $nv\n";
+        print "- $ov &#x21D1;"; # up arrow
+        if (my $pr = readlink(cachedir($ov) . "/.pr")) {
+            print " (built in #$pr)";
+        }
+        print "\n\n";
+    }
+
+    if ($across) {
+        print "|  |";
+        print "*$_*|"               for @Images_Wanted;
+        print "\n";
+
+        print "|----|";
+        print "----|"               for @Images_Wanted;
+        print "\n";
+
+      PACKAGE:
+        for my $p (@Packages_Wanted) {
+            my $row = sprintf("|%-15s|", "*$p*");
+
+            for my $i (@Images_Wanted) {
+                my $now = $new_version->{$p}{$i} || '?';
+                $now =~ s/~/\\~/g;      # debian versions can include tilde
+                $row .= sprintf(" %-15s |", $now);
+            }
+            $row .= "\n";
+
+            if ($old_version) {
+                my $found_diff;
+
+                $row .= sprintf("|%-15s|", "");
+                for my $i (@Images_Wanted) {
+                    my $baseline = '';
+                    if (my $from = $old_version->{$p}{$i}) {
+                        if (my $now = $new_version->{$p}{$i}) {
+                            if ($now ne $from) {
+                                $from =~ s/~/\\~/g;
+
+                                $baseline = "$from&nbsp;&#x21D1;"; # up arrow
+                                $found_diff = 1;
+                            }
+                        }
+                    }
+                    $row .= sprintf(" %-14s |", $baseline);
+                }
+                $row .= "\n";
+                next PACKAGE            if $Skip_Empty_Diffs && !$found_diff;
+            }
+
+            print $row;
+        }
+    }
+    else {
+        for (my $i=0; $i < @Packages_Wanted; $i += 4) {
+            print "|*Distro*|";
+            for (my $j=0; $j < 4 && ($i + $j < @Packages_Wanted); $j++) {
+                printf "*%s*|", $Packages_Wanted[$i + $j];
+            }
+            print "\n";
+
+            print "|-----|";
+            for (my $j=0; $j < 4 && ($i + $j < @Packages_Wanted); $j++) {
+                print "----|";
+            }
+            print "\n";
+
+            for my $distro (@Images_Wanted) {
+                print "|*$distro*|";
+                for (my $j=0; $j < 4 && ($i + $j < @Packages_Wanted); $j++) {
+                    my $p = $Packages_Wanted[$i+$j];
+                    printf " %s |", $new_version->{$p}{$distro} || '-';
+                }
+                print "\n";
+            }
+
+            print "\n";
+        }
+    }
+}
+
+
+1;
