@@ -83,6 +83,21 @@ Podman kube play test with reserved PublishAll annotation in yaml
     - Ok? y
 ```
 
+Important special case: IDs `9999x` are reserved for "not yet filed".
+Sometimes I see a few instances of flakes that look related but
+they manifest in different tests, hence they don't get clustered
+in the HTML page. For those I will usually do:
+```
+$ cirrus-flake-assign 99999 12345 12346 12347 12348
+$ cirrus-flake-catchup
+```
+(or 99998, or 7, when I've got more than one in flight).
+
+This will force-cluster them in one HTML group, from which I
+can look for patterns. If they merit filing an issue, and
+they usually do, I use `cirrus-flake-xref --markdown --filter=99999`
+and include the output when filing the issue.
+
 [cirrus-flake-grep](cirrus-flake-grep)
 -----------------
 
