@@ -1,0 +1,26 @@
+#!/bin/bash
+
+set -e
+
+cd $(dirname $0)
+
+export TZ=US/Eastern
+
+TOOL=cirrus-timing-history
+for i in *;do
+    if [[ -d $i ]]; then
+        cd $i
+        git pull -q -r origin main
+        $TOOL
+        rsync -a /tmp/$TOOL-$i.html l.edsantiago.com:/var/www/edsantiago/$TOOL/$i.html
+        cd ..
+    fi
+done
+
+github-issue-plot
+rsync -a /tmp/github-issue-plot-plotly.html l.edsantiago.com:/var/www/edsantiago/github-issues.html
+
+bats=/tmp/plot-bats-plotly.html
+if [[ -e $bats ]]; then
+    rsync -a $bats l.edsantiago.com:/var/www/edsantiago/bats-timing.html
+fi

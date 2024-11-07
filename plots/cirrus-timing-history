@@ -1,0 +1,446 @@
+#!/usr/bin/perl
+#
+# cirrus-timing-history - read and plot Cirrus PR timings
+#
+# $Id: cirrus-timing-history,v 1.28 2024/10/07 12:01:52 esm Exp esm $
+#
+package ESM::CirrusTimingHistory;
+
+use v5.14;
+use utf8;
+use open qw( :encoding(UTF-8) :std );
+
+use strict;
+use warnings;
+
+(our $ME = $0) =~ s|.*/||;
+(our $VERSION = '$Revision: 1.28 $ ') =~ tr/[0-9].//cd;
+
+use File::Temp          qw(tempdir);
+use List::Util          qw(max);
+use Time::Piece;
+
+###############################################################################
+# BEGIN user-customizable section
+
+our $Timing_Dir = "/home/esm/.local/share/cirrus-pr-timing";
+
+# Overridden by 'git remote -v'
+our $Project = 'podman';
+
+our %Breakdown = (
+    podman   => [ qw(int sys machine) ],
+    buildah  => [ ("Integration", "Build Conformance", "Unit") ],
+    skopeo   => [ qw(Skopeo) ],
+    netavark => [ qw(zxxzc) ],
+);
+
+# END   user-customizable section
+###############################################################################
+
+###############################################################################
+# BEGIN boilerplate args checking, usage messages
+
+sub usage {
+    print  <<"END_USAGE";
+Usage: $ME [OPTIONS] ARGS [...]
+
+blah blah blah
+
+OPTIONS:
+
+  -v, --verbose  show verbose progress indicators
+  -n, --dry-run  make no actual changes
+
+  --help         display this message
+  --version      display program name and version
+END_USAGE
+
+    exit;
+}
+
+
+# Command-line options.  Note that this operates directly on @ARGV !
+our $debug   = 0;
+our $force   = 0;
+our $verbose = 0;
+our $NOT     = '';              # print "blahing the blah$NOT\n" if $debug
+sub handle_opts {
+    use Getopt::Long;
+    GetOptions(
+        'debug!'     => \$debug,
+        'dry-run|n!' => sub { $NOT = ' [NOT]' },
+        'force'      => \$force,
+        'verbose|v'  => \$verbose,
+
+        help         => \&usage,
+        version      => sub { print "$ME version $VERSION\n"; exit 0 },
+    ) or die "Try `$ME --help' for help\n";
+}
+
+# END   boilerplate args checking, usage messages
+###############################################################################
+
+############################## CODE BEGINS HERE ###############################
+
+# The term is "modulino".
+__PACKAGE__->main()                                     unless caller();
+
+# Main code.
+sub main {
+    # Note that we operate directly on @ARGV, not on function parameters.
+    # This is deliberate: it's because Getopt::Long only operates on @ARGV
+    # and there's no clean way to make it use @_.
+    handle_opts();                      # will set package globals
+
+    # Fetch command-line arguments.  Barf if too many.
+    die "$ME: Too many arguments; try $ME --help\n"                 if @ARGV;
+
+    # Figure out our repo
+    our $remotes = qx{git remote -v};
+    $remotes =~ m!github\.com.containers/(\w+)!
+        or die "$ME: Could not determine project name from 'git remote -v'\n";
+    $Project = $1;
+
+    # FIXME: do code here
+    my @timings = get_timings();
+    #use Data::Dump; dd \@timings;
+
+#    plot_timings(@timings);
+    plot_timings_using_plotly(@timings);
+}
+
+
+sub plot_timings {
+    my @timings = @_;
+
+    # FIXME: switch to plotly?
+    # one tempfile for each CI test. Make a tempdir to hold them.
+    my %datafile;
+    my $tmpdir = tempdir( "$ME.XXXXXXX", TMPDIR => 1, CLEANUP => !$debug );
+    for my $tuple (@timings) {
+        my $tests = $tuple->[-1];
+        for my $testname (sort keys %$tests) {
+            my $seconds = $tests->{$testname};
+            next if $seconds < 300;             # probably skipped
+
+            my $fh;
+            if (exists $datafile{$testname}) {
+                $fh = $datafile{$testname}{fh};
+            }
+            else {
+                (my $testname_safe = $testname) =~ s/[^a-z0-9-]/-/gi;
+                my $outfile = "$tmpdir/$testname_safe";
+                open $fh, '>', $outfile
+                    or die "$ME: Cannot append to $outfile: $!\n";
+                $datafile{$testname}{fh} = $fh;
+                $datafile{$testname}{outfile} = $outfile;
+            }
+
+            printf { $fh } "%d, %d\n", $tuple->[0], $seconds;
+        }
+    }
+    for my $testname (sort keys %datafile) {
+        close $datafile{$testname}{fh}
+            or die "$ME: Error writing $datafile{$testname}{outfile}: $!\n";
+    }
+
+    for my $type (qw(int sys machine)) {
+        my $gnuplot_infile = "$tmpdir/$type.gnuplot";
+        open my $gnuplot_fh, '>', $gnuplot_infile
+            or die "$ME: Cannot create $gnuplot_infile: $!\n";
+        print { $gnuplot_fh } <<"END_GNUPLOT";
+set terminal png enhanced size 1280, 1024
+set output "/tmp/$ME-$type.png"
+set title "$type tests"
+set xdata time
+set timefmt "%s"
+set format x "%m/%d"
+set ydata time
+set format y "%M:%S"
+set yrange [0:3599]
+END_GNUPLOT
+
+        # PR labels
+        my $t0 = 0;
+        for my $tuple (@timings) {
+            my $t = $tuple->[0];
+            if ($t - $t0 > 86400 * 5) {
+                printf { $gnuplot_fh } "set label \"%s\" at %d, 100\n", $tuple->[1], $t;
+                $t0 = $t;
+            }
+        }
+
+        # FIXME: find min point, plot PR as text
+        print { $gnuplot_fh } "plot";
+        my $comma = '';
+        for my $testname (sort grep { /^$type[\s-]/ } keys %datafile) {
+            (my $title = $testname) =~ s/^$type[\s-]//;
+            printf { $gnuplot_fh } "%s \"%s\" using 1:2 with linespoints title \"$title\"",
+                $comma, $datafile{$testname}{outfile};
+            $comma = ',';
+        }
+        print { $gnuplot_fh } "\n";
+
+        close $gnuplot_fh;
+
+        system('gnuplot', $gnuplot_infile);
+    }
+}
+
+
+sub plot_timings_using_plotly {
+    my @timings = @_;
+
+    exists $Breakdown{$Project}
+        or die "Please define a \%Breakdown for $Project";
+    my @types = @{$Breakdown{$Project}};
+
+
+    my $outfile = "/tmp/$ME-$Project.html";
+    my $tmpfile = "$outfile.tmp.$$";
+    unlink $tmpfile;
+
+    my $now = localtime->strftime("%b %d %H:%M %Z");
+    my $types = join(', ', map { "<b>$_</b>" } @types);
+    $types =~ s/(.*,)/$1 and/;
+
+    open my $fh_html, '>', $tmpfile
+        or die "$ME: Cannot create $tmpfile: $!\n";
+    printf { $fh_html } <<'END_HTML', (ucfirst($Project))x2, $now, $Project, ($timings[-1][1]) x 2, $types;
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en-US">
+  <head>
+    <meta http-equiv="Content-type" content="text/html; charset=UTF-8" />
+    <title>%s Cirrus Timings</title>
+    <script src="https://cdn.plot.ly/plotly-2.32.0.min.js" charset="utf-8"></script>
+
+    <style type="text/css">
+      /* plotly modebar (the thing that lets you zoom pan etc): left, not right */
+      /* https://stackoverflow.com/questions/45173726/place-the-modebar-at-top-center-using-plotly-js */
+      .js-plotly-plot .plotly .modebar { left: 5%%; }
+    </style>
+  </head>
+
+  <body>
+    <h1>%s Cirrus Timings</h1>
+    <h3>Updated <u>%s</u>; most recent PR is <a href="https://github.com/containers/%s/pull/%s">%s</a></h3>
+<p>
+The plots below show CI timing results for %s
+tests.
+</p>
+
+<p>
+<i>Please note that the X axis is <b>PR merge date</b>, not run date. Merge date
+can be days or even weeks after CI has run. Reason: no date choice is perfect.
+Merge date at least gives us a sort of linear progression of what <tt>main</tt>
+will look like as of that point in time, if a given PR increases or decreases
+run time significantly.
+</i>
+</p>
+
+<p>
+Hover over the plot to get deeper results. PR is shown to the right of each
+timing value. Use the plotly <b>Zoom</b> feature to look at a subsection with
+finer granularity. Click the colored line segments
+at right to hide/show individual plot lines.
+</p>
+<p>
+EXPERIMENTAL: colors: blueish for Fedora, reddish for Debian, green for containerized.
+Darker colors are root, lighter colors for rootless. Dashed means remote.
+</p>
+END_HTML
+
+    for my $type (@types, 'total') {
+        printf { $fh_html } <<'END_HTML', $type;
+    <hr />
+    <div class="plotbox" id="plot_%s">
+    </div>
+END_HTML
+    }
+
+
+    # FIXME: massage data
+    my %foo;
+    for my $tuple (@timings) {
+        my $tests = $tuple->[-1];
+        for my $testname (sort keys %$tests) {
+
+            my $seconds = $tests->{$testname};
+            next if $seconds < 300;             # probably skipped
+
+            push @{$foo{$testname}{x}}, $tuple->[0] * 1000;
+            push @{$foo{$testname}{y}}, $seconds;
+            push @{$foo{$testname}{mmss}}, sprintf("'<b>%d:%02d</b> pr%d'", $seconds/60, $seconds % 60, $tuple->[1]);
+            push @{$foo{$testname}{pr}}, $tuple->[1];
+        }
+    }
+
+
+    for my $type (@types, 'total') {
+        my $max_t = 1200;                       # Assume 20-minute max
+
+        printf { $fh_html } <<'END_HTML', $type;
+
+    <script>
+      var type = '%s';
+      var data = [];
+
+END_HTML
+
+
+        # Test timings. 'total' is a special case.
+        my @tests = sort grep { /^$type[\s-]/ } keys %foo;
+        if ($type eq 'total') {
+            @tests = sort grep { /urationInSeconds/ } keys %foo;
+        }
+        for my $test (@tests) {
+            # Colors and styles for lines
+            my %linestyle = (width => 1);
+            if ($test =~ /fedora|rawhide/) {
+                $linestyle{color} = '#294172';
+                $linestyle{color} = '#9cf' if $test =~ /rootless/;
+            }
+            elsif ($test =~ /debian/) {
+                $linestyle{color} = '#a80030';
+                $linestyle{color} = '#ff6666' if $test =~ /rootless/;
+            }
+            if ($test =~ /container/) {
+                $linestyle{color} = '#6f6';
+            }
+            if ($test =~ /remote/) {
+                $linestyle{dash} = 'dot';
+            }
+
+            (my $testlabel = $test) =~ s/^$type[\s-]//;
+            $testlabel =~ s/fedora-/f/g;
+            $testlabel =~ s/debian-/deb/g;
+            $testlabel =~ s/podman//g;
+            $testlabel =~ s/\shost\s/ /g;
+
+            # Almost always want lines, they're cleaner, but with very few
+            # data points markers are easier.
+            my $mode = 'lines';
+            $mode .= '+markers' if @{$foo{$test}{x}} < 5;
+            $mode = "markers" if $type eq 'total';
+
+            printf { $fh_html } <<'END_HTML', join(', ', @{$foo{$test}{x}}), join(', ', @{$foo{$test}{y}}), join(', ', @{$foo{$test}{pr}}), join(', ', @{$foo{$test}{mmss}}), $mode, join(', ', map { "$_: \"$linestyle{$_}\"" } keys %linestyle), $testlabel;
+
+            data.push({
+                x: [ %s ],
+                y: [ %s ],
+                pr: [ %s ],
+                text: [ %s ],
+                mode: '%s',
+                line: { %s },
+                name: '%s',
+                connectgaps: false,
+                hovertemplate: '%%{text}',
+           });
+END_HTML
+
+            $max_t = max($max_t, @{$foo{$test}{y}});
+        }
+
+        $max_t = int(($max_t + 599) / 600.0) * 600;
+        my @tickvals = map { $_ * 600 } (0 .. $max_t / 600);
+        my $tickvals = join(', ', @tickvals);
+        my $ticktext = join(', ', map { sprintf("'%d:00'", $_ / 60) } @tickvals);
+
+        printf { $fh_html } <<'END_HTML', $max_t-1, $tickvals, $ticktext;
+
+
+      var layout = {
+         paper_bgcolor: '#f6f6e6',
+         plot_bgcolor: '#ffffff',
+         height: 900,
+         // FIXME: 2020-10-10: trying to get 'Oct 10, 2020' to render in
+         // the center of the range, not LHS. No luck yet.
+         // https://plotly.com/python/time-series/
+         // https://plotly.com/r/reference/layout/xaxis/
+         //xaxis: { type: 'date', ticklabelmode: 'period', range: [ data.t0, data.t1 ] },
+         xaxis: { type: 'date', ticklabelmode: 'period' },
+         yaxis: { title: '<b>' + type + '</b>', range: [ 0, %d ],
+                  tickmode: 'array',
+                  tickvals: [ %s ],
+                  ticktext: [ %s ],
+                },
+         showlegend: true,  // FIXME was false
+         scrollZoom: true,  // FIXME was false
+         dragmode: false,
+         hovermode: 'x unified',    /* otherwise defaults to unhelpful compare */
+         <!-- maximize usable display space. -->
+         <!-- per https://community.periscopedata.com/t/187z9z/remove-whitespace-margins-from-plotly-charts -->
+         <!-- the default margins are top=100, rest=80. -->
+         <!-- top margin cannot be <5, otherwise a top Y tick can be chopped -->
+         margin: { l:80, r:1, b:40, t:5 },
+     };
+
+      Plotly.newPlot('plot_' + type, data, layout);
+    </script>
+END_HTML
+    }
+
+    print { $fh_html } <<'END_HTML';
+</body>
+</html>
+END_HTML
+
+    close $fh_html
+        or die "$ME: Error writing $tmpfile: $!\n";
+    chmod 0444 => $tmpfile;
+    rename $tmpfile => $outfile
+        or die "$ME: could not rename $tmpfile: $!\n";
+}
+
+
+
+
+
+sub get_timings {
+    my @timings;
+
+    my @git = ('git', 'log', '--pretty=format:%h %ct  %s', 'main');
+    open my $git_log_fh, '-|', @git
+        or die "$ME: Cannot fork: $!\n";
+  LINE:
+    while (my $line = <$git_log_fh>) {
+        chomp $line;
+        $line =~ /^([0-9a-f]+)\s+(\d+)\s+(.*)/
+            or die "$ME: Cannot grok git log line '$line'\n";
+        my ($sha, $t, $msg) = ($1, $2, $3);
+
+        # 3 months seems good enough
+        last LINE if $t < time - 365 * 86400 / 2;
+
+        $msg =~ /Merge pull request #(\d+) from/
+            or next LINE;
+        my $pr = $1;
+        next if $pr eq '19518';     # FIXME: special case for PR that had f39beta
+        my $timing_file = sprintf("%s/%s/by-pr/%02d/%d.txt", $Timing_Dir, $Project, $pr % 100, $pr);
+        if (! -e $timing_file) {
+            warn "$ME: fetching timings for $Project PR $pr\n";
+            system("cirrus-pr-timing --project=$Project --save $pr >/dev/null 2>&1");
+        }
+        open my $timing_fh, '<', $timing_file
+            or do {
+                warn "$ME:  ...still no results for $pr\n";
+                next LINE;
+            };
+        unshift @timings, [ $t, $pr, $sha, {} ];
+
+        while (my $result = <$timing_fh>) {
+            chomp $result;
+            if ($result =~ /^\s*(.*\S)\s+(\d+)$/) {
+                $timings[0][-1]{$1} = $2;
+            }
+        }
+        close $timing_fh;
+    }
+
+    close $git_log_fh;
+
+    return @timings;
+}
+
+
+1;
