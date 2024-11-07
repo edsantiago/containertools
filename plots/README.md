@@ -16,4 +16,4 @@ but I need them in order to do `git pull` then `git log`, and
 get PR numbers and commit times from that log.
 
 [cirrus-timing-history](cirrus-timing-history) is the script
-that generates the plots. It relies on [cirrus-pr-timing](../cirrus-pr-timing).
+that generates the plots. It relies on [cirrus-pr-timing](../ci-watch/cirrus-pr-timing).
