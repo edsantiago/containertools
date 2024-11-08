@@ -392,7 +392,10 @@ sub parse_timings {
                 $fs = $1;
             }
 
-            my $distro = 'f39';         # FIXME
+            # FIXME! Podman task names include distro, but
+            # buildah does not. We have to bump this every
+            # time buildah bumps VMs.
+            my $distro = 'f40';         # FIXME
             if ($name =~ /(fedora|debian)-(\d+)/) {
                 $distro = substr($1, 0, 1) . $2;
             }
