@@ -1,0 +1,26 @@
+#!/bin/bash
+#
+# nightly backup, because databases are fragile
+#
+
+set -e
+
+cd ~/.local/share/cirrus-flake-summarize
+
+yy=$(date --utc +'%Y')
+mm=$(date --utc +'%m')
+ts=$(date --utc +'%Y-%m-%dT%H%M%SZ')
+
+# * is buildah podman etc
+for i in *;do
+    cd $i
+    dir=backups/$yy/$mm
+    mkdir -p $dir
+    bkpfile="$dir/$i.$ts.sqlite"
+    sqlite3 db.sqlite ".backup $bkpfile"
+    xz "$bkpfile"
+
+    cd ..
+done
+
+# FIXME FIXME: some sort of cleanup?
