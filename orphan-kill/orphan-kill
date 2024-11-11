@@ -1,0 +1,74 @@
+#!/usr/bin/perl
+#
+# orphan-kill - link to Google/AWS for orphans
+#
+(our $ME = $0) =~ s|^.*/||;
+
+use v5.30;
+use strict;
+use warnings;
+
+
+my $google_base = 'https://console.cloud.google.com/compute/instances';
+
+my $aws_base = 'https://us-east-1.console.aws.amazon.com/ec2/home?region=us-east-1#InstanceDetails:';
+
+open my $fh, '>>', '/tmp/foo.log';
+
+
+my $linker = '';
+while (my $line = <STDIN>) {
+    print { $fh } $line;
+    chomp $line;
+
+    if ($line =~ s/^Orphaned\s//) {
+        if ($line =~ /^AWS EC2 /) {
+            $linker = \&linkto_aws;
+        }
+        elsif ($line =~ /^((libpod|conmon)-\d+) /) {
+            my $project = $1;
+            $linker = sub { linkto_google($project, @_); };
+        }
+        else {
+            die "$ME: Could not identify orphans from '$line'";
+        }
+        next;
+    }
+
+    if ($line =~ /^\*\s+VM\s+(\S+)/) {
+        my $instance = $1;
+        defined $linker
+            or die "$ME: Saw '$line' without a prior 'Orphaned XXX' line";
+        my $link = $linker->($instance);
+        print " -- $link\n";
+        system('browser-open', $link);
+    }
+}
+
+close $fh;
+
+sub linkto_aws {
+    my $instance = shift;
+
+    return $aws_base . "Name=$instance"        if $instance =~ /^cirrus-task-/;
+    return $aws_base . "instanceId=$instance"  if $instance =~ /^i-/;
+
+    die "$ME: AWS: cannot grok instance '$instance'";
+}
+
+sub linkto_google {
+    my $project  = shift;
+    my $instance = shift;
+
+    return sprintf("https://console.cloud.google.com/compute/instancesDetail/zones/us-central1-a/instances/%s?project=%s", $instance, $project);
+}
+
+# FIXME! 2024-10-22 today's machines are in us-central1-a (not f). The email
+# does not include a zone. And I don't see any way to search for machines
+# without giving a zone.
+#    https://console.cloud.google.com/compute/instancesDetail/zones/us-central1-a/instances/packer-670e8cf7-0cc8-0258-f4a6-6c2ec691096c?project=libpod-218412
+#
+#    https://console.cloud.google.com/compute/instances?project=libpod-218412
+#
+# FIXME: also need to delete disks?
+#     https://console.cloud.google.com/compute/disksDetail/zones/us-central1-a/disks/packer-671107d0-e85c-d710-dcdb-d0ca8c14e546?project=libpod-218412

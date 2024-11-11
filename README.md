@@ -12,4 +12,5 @@ scripts I have. Feed it a PR, it will (if possible) spit out the Cirrus BuildID
 for that PR. (Remember, a Cirrus *build* is a set of many *tasks*, each of which
 is a VM-test combination)
 * [openqa-listener](openqa-listener) - alert if podman openqa jobs fail
+* [orphan-kill](orphan-kill/) - helper for handling "orphan VM" emails
 * [plots](plots/) - generate time-series plots showing how long CI jobs take
