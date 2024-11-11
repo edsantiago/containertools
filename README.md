@@ -11,6 +11,7 @@ versions on `automation_images` (new-VM) PRs
 scripts I have. Feed it a PR, it will (if possible) spit out the Cirrus BuildID
 for that PR. (Remember, a Cirrus *build* is a set of many *tasks*, each of which
 is a VM-test combination)
+* [git-sha-to-pr](git-sha-to-pr/) - given a git SHA, shows its corresponding PR
 * [openqa-listener](openqa-listener) - alert if podman openqa jobs fail
 * [orphan-kill](orphan-kill/) - helper for handling "orphan VM" emails
 * [plots](plots/) - generate time-series plots showing how long CI jobs take

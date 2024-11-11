@@ -1,0 +1,245 @@
+#!/usr/bin/perl
+#
+# git-sha-to-pr - given a SHA, show which PR merged it
+#
+package ESM::GitShaToPR;
+
+use v5.14;
+use utf8;
+use open qw( :encoding(UTF-8) :std );
+
+use strict;
+use warnings;
+
+(our $ME = $0) =~ s|.*/||;
+(our $VERSION = '$Revision: 1.10 $ ') =~ tr/[0-9].//cd;
+
+# For debugging, show data structures using DumpTree($var)
+#use Data::TreeDumper; $Data::TreeDumper::Displayaddress = 0;
+
+###############################################################################
+# BEGIN user-customizable section
+
+# END   user-customizable section
+###############################################################################
+
+###############################################################################
+# BEGIN boilerplate args checking, usage messages
+
+sub usage {
+    print  <<"END_USAGE";
+Usage: $ME [OPTIONS] SHA
+
+blah blah blah
+
+OPTIONS:
+
+  -v, --verbose  show verbose progress indicators
+  -n, --dry-run  make no actual changes
+
+  --help         display this message
+  --man          display program man page
+  --version      display program name and version
+END_USAGE
+
+    exit;
+}
+
+# Command-line options.  Note that this operates directly on @ARGV !
+our $debug   = 0;
+our $force   = 0;
+our $verbose = 0;
+our $NOT     = '';              # print "blahing the blah$NOT\n" if $debug
+sub handle_opts {
+    use Getopt::Long;
+    GetOptions(
+        'debug!'     => \$debug,
+        'dry-run|n!' => sub { $NOT = ' [NOT]' },
+        'force'      => \$force,
+        'verbose|v'  => \$verbose,
+
+        help         => \&usage,
+        man          => \&man,
+        version      => sub { print "$ME version $VERSION\n"; exit 0 },
+    ) or die "Try `$ME --help' for help\n";
+}
+
+# END   boilerplate args checking, usage messages
+###############################################################################
+
+############################## CODE BEGINS HERE ###############################
+
+# The term is "modulino".
+__PACKAGE__->main()                                     unless caller();
+
+# Main code.
+sub main {
+    # Note that we operate directly on @ARGV, not on function parameters.
+    # This is deliberate: it's because Getopt::Long only operates on @ARGV
+    # and there's no clean way to make it use @_.
+    handle_opts();                      # will set package globals
+
+    # Fetch command-line arguments.  Barf if too many.
+    my $sha = shift(@ARGV)
+        or die "$ME: missing SHA argument; try $ME --help\n";
+    die "$ME: Too many arguments; try $ME --help\n"                 if @ARGV;
+
+    show_pr_for(full_sha($sha));
+}
+
+sub show_pr_for {
+    my $sha = shift;
+
+    my $graph = git_graph();
+
+    my $pr_info = find_merge_pr($sha, $graph);
+
+#    my @tags = find_tags($pr_sha, \@log);
+    # FIXME: add options to show author, timestamp, branch
+    printf "%s  %s  %s  %s  %s\n",
+        $pr_info->{id},
+        $pr_info->{timestamp},
+        $pr_info->{author},
+        join(" ", @{$pr_info->{tags}}),
+        pr_link($pr_info->{id});
+}
+
+sub git_graph {
+    my @cmd = ('git', 'log', '--all', '--format=%H %P %d');
+    open my $git_fh, '-|', @cmd
+        or die "$ME: Could not fork: $!\n";
+
+    my %graph;
+    while (my $line = <$git_fh>) {
+        chomp $line;
+        my @tags;
+        if ($line =~ s/\s+\((.*)\)\s*$//) {
+            my $tags = $1;
+            for my $t (split ', ', $tags) {
+                $t =~ s/^HEAD\s*->\s*//;
+                next if $t =~ m!/!;             # skip slashed tags
+                push @tags, $t if $t =~ /^(main|v\d)/;
+            }
+        }
+        my ($commit, @parents) = split ' ', $line;
+
+        $graph{$commit} //= { parents => [], into => [], tags => [] };
+        push @{ $graph{$commit}{parents} }, @parents;
+        push @{ $graph{$commit}{tags} }, @tags;
+
+        for my $p (@parents) {
+            $graph{$p} //= { parents => [], into => [], tags => [] };
+            push @{ $graph{$p}{into} }, $commit;
+        }
+    }
+    close $git_fh
+        or die "$ME: Command failed: @cmd\n";
+
+    return \%graph;
+}
+
+sub full_sha {
+    my $sha = shift;
+
+    chomp(my $full_sha = qx{git rev-parse ${sha}^{commit}});
+    die "Git failed\n" if $?;
+
+    die "$ME: No sha found for $sha\n" if !$full_sha;
+    return $full_sha;
+}
+
+
+sub find_merge_pr {
+    my $sha   = shift;
+    my $graph = shift;
+
+    my $into = $graph->{$sha}
+        or die "$ME: Internal error: cannot find $sha in graph";
+
+    my @into = @{$into->{into}}
+        or die "$ME: Commit $sha is not merged anywhere\n";
+
+    for my $commit (@into) {
+        open my $git_fh, '-|', 'git', 'log', '-1', '--format=%ci %s', $commit
+            or die "$ME: Cannot fork: $!\n";
+        chomp(my $log = do { local $/ = undef; <$git_fh>; });
+        close $git_fh
+            or die "$ME: git-log-etc died: $!\n";
+
+        print "[find_merge_pr] $sha > $commit > $log\n"         if $debug;
+        if ($log =~ /Merge pull request \#(\d+) from/) {
+            my $pr = $1;
+
+            $log =~ /^([\d -]+)\s/
+                or die "$ME: Bad timestamp in $log\n";
+            my $timestamp = $1;
+
+            chomp(my $author = qx{git log -1 --format=%aE $sha});
+
+            my @tags = find_tags($commit, $graph);
+            if (grep { $_ eq 'main' } @tags) {
+                @tags = ('main');
+            }
+            return { id => $pr,
+                     author => $author,
+                     commit => $commit,
+                     tags => \@tags,
+                     timestamp => $timestamp,
+                 };
+        }
+    }
+
+    # Nope. Pass 2: check parents
+    return find_merge_pr($into[0], $graph);
+}
+
+sub find_tags {
+    my $sha   = shift;
+    my $graph = shift;
+
+    state %seen;
+
+    my @tags = @{ $graph->{$sha}{tags} };
+#    use Data::Dump; dd \@tags;
+    for my $into (@{ $graph->{$sha}{into} }) {
+        next if $seen{$into}++;
+        print " find_tags( $sha -> $into )\n"           if $debug;
+
+        no warnings 'recursion';
+        for my $t (find_tags( $into, $graph )) {
+            print "    -> $t\n"                         if $debug;
+            push @tags, $t unless grep { $_ eq $t } @tags;
+        }
+    }
+
+    return @tags;
+}
+
+
+#############
+#  pr_link  #  Link to github
+#############
+sub pr_link {
+    my $id = shift;
+
+    my $repo;
+    open my $git_fh, '-|', 'git', 'remote', '-v'
+        or die "$ME: Cannot fork: $!\n";
+    while (my $line = <$git_fh>) {
+        if ($line =~ m!github\.com:/?(containers/\S+)\s!) {
+            $repo = $1;
+            # Handle containers/podman.git or containers/storage
+            $repo =~ s/\.git$//;
+        }
+    }
+    close $git_fh
+        or die "$ME: Error running git-remote";
+
+    defined $repo
+        or die "$ME: 'git remote -v' did not find a repo";
+
+    return "https://github.com/$repo/pull/$id";
+}
+
+
+1;
