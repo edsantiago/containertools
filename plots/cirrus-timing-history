@@ -2,8 +2,6 @@
 #
 # cirrus-timing-history - read and plot Cirrus PR timings
 #
-# $Id: cirrus-timing-history,v 1.28 2024/10/07 12:01:52 esm Exp esm $
-#
 package ESM::CirrusTimingHistory;
 
 use v5.14;
@@ -23,7 +21,7 @@ use Time::Piece;
 ###############################################################################
 # BEGIN user-customizable section
 
-our $Timing_Dir = "/home/esm/.local/share/cirrus-pr-timing";
+our $Timing_Dir = "$ENV{HOME}/.local/share/cirrus-pr-timing";
 
 # Overridden by 'git remote -v'
 our $Project = 'podman';

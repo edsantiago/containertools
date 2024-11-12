@@ -2,8 +2,6 @@
 #
 # cirrus-flake-assign - assign a cause/issue to a flake
 #
-# $Id: cirrus-flake-assign,v 1.17 2024/08/19 20:06:08 esm Exp esm $
-#
 package LibPod::CirrusFlakeAssign;
 
 use v5.14;
@@ -16,15 +14,12 @@ use warnings;
 (our $ME = $0) =~ s|.*/||;
 (our $VERSION = '$Revision: 1.17 $ ') =~ tr/[0-9].//cd;
 
-# For debugging, show data structures using DumpTree($var)
-use Data::TreeDumper; $Data::TreeDumper::Displayaddress = 0;
-
 ###############################################################################
 # BEGIN user-customizable section
 
 our $Project = 'podman';
 
-our $DB_Dir = "/home/esm/.local/share/cirrus-flake-summarize";
+our $DB_Dir = "$ENV{HOME}/.local/share/cirrus-flake-summarize";
 
 $ENV{TZ} = 'US/Eastern';
 

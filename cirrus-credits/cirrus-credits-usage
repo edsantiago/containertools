@@ -20,7 +20,7 @@ use warnings;
 ###############################################################################
 # BEGIN user-customizable section
 
-our $History = "/home/esm/.cirrus-credits/history.csv";
+our $History = "$ENV{HOME}/.cirrus-credits/history.csv";
 
 # END   user-customizable section
 ###############################################################################

@@ -2,8 +2,6 @@
 #
 # cirrus-flake-grep - search for flake patterns in logs
 #
-# $Id: cirrus-flake-grep,v 1.10 2024/02/08 13:51:33 esm Exp esm $
-#
 package ESM::CirrusFlakeGrep;
 
 use v5.14;
@@ -23,7 +21,7 @@ no warnings 'utf8';
 ###############################################################################
 # BEGIN user-customizable section
 
-our $Base_Dir = "/home/esm/.local/share/cirrus-flake-summarize";
+our $Base_Dir = "$ENV{HOME}/.local/share/cirrus-flake-summarize";
 
 our $Project = 'podman';
 

@@ -12,7 +12,7 @@ echo $credits
 
 # If running from cron, log history
 if ! [[ -t 0 ]]; then
-    log=/home/esm/.cirrus-credits/history.csv
+    log=$HOME/.cirrus-credits/history.csv
     printf "\"%s\", %s\n" "$(date --iso-8601=seconds)" $credits >>$log
 fi
 

@@ -2,8 +2,6 @@
 #
 # cirrus-flake-summarize - fetch Cirrus logs for a build, summarize flakes
 #
-# $Id: cirrus-flake-summarize,v 1.83 2024/08/01 18:19:15 esm Exp esm $
-#
 package LibPod::CirrusFlakeSummarize;
 
 use v5.14;
@@ -31,7 +29,7 @@ $ua->agent("$ME " . $ua->agent);              # Identify ourself
 ###############################################################################
 # BEGIN user-customizable section
 
-our $Base_Dir = "/home/esm/.local/share/cirrus-flake-summarize";
+our $Base_Dir = "$ENV{HOME}/.local/share/cirrus-flake-summarize";
 
 our $Project = 'podman';
 

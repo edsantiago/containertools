@@ -2,8 +2,6 @@
 #
 # cirrus-flake-xref - generate cross-ref of cirrus flakes
 #
-# $Id: cirrus-flake-xref,v 1.55 2024/08/26 12:53:44 esm Exp esm $
-#
 package LibPod::CirrusFlakeCrossref;
 
 use v5.14;
@@ -24,9 +22,9 @@ use Data::TreeDumper; $Data::TreeDumper::Displayaddress = 0;
 
 our $Project = 'podman';
 
-our $DB_Dir = "/home/esm/.local/share/cirrus-flake-summarize";
+our $DB_Dir = "$ENV{HOME}/.local/share/cirrus-flake-summarize";
 
-our $HTML_Dir = "/home/esm/public_html/$ME";
+our $HTML_Dir = "$ENV{HOME}/public_html/$ME";
 
 $ENV{TZ} = 'US/Eastern';
 

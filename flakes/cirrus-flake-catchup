@@ -15,7 +15,7 @@ fi
 for PROJECT in podman buildah skopeo netavark; do
     echo -e "\e[34m" $PROJECT "\e[m"
 
-    DB="/home/esm/.local/share/cirrus-flake-summarize/$PROJECT/db.sqlite"
+    DB="$HOME/.local/share/cirrus-flake-summarize/$PROJECT/db.sqlite"
 
     curl -s -S -H "Authorization: bearer $GITHUB_TOKEN" -X POST --data '{ "query": "{ repository(owner:\"containers\", name: \"'$PROJECT'\") { pullRequests(states:[MERGED], first:30, orderBy: {field:UPDATED_AT,direction:DESC}) { nodes { number title } } } }" }' https://api.github.com/graphql \
         | jq -r '.data.repository.pullRequests.nodes[] | "\(.number) \(.title)"' \
