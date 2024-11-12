@@ -24,12 +24,15 @@ At Least Daily, Manually
 ========================
 
 * [flakes](flakes/) - the big one. Tools for tracking and cataloging flakes.
-* [plots](plots/) - generate time-series plots showing how long CI jobs take
+* [plots](plots/) - generate time-series plots showing how long CI jobs take.
+This one should run from cron, maybe every 2-4 hours. It's just too new so I
+wanted to get a sense for it (results, unexpected hiccups) before letting go.
 
 Cron
 ====
 
-Mostly run from cron, with occasional human intervention:
+Mostly run from cron, with occasional human intervention when I see unexpected
+results in my morning email:
 
 * [cirrus-credits](cirrus-credits/) - track Cirrus credits, warn if low
 * [cirrus-cronjobs](cirrus-cronjobs/) - simplified maintenance of nightly CI runs
