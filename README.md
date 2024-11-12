@@ -38,6 +38,6 @@ results in my morning email:
 * [cirrus-cronjobs](cirrus-cronjobs/) - simplified maintenance of nightly CI runs
 * [quay-check](quay-check) - make sure quay.io images have reasonable descriptions
 
-This one is quadlet, not cron, but same idea, it runs unattended:
+This one is a systemd unit, not cron, but same idea, it runs unattended:
 
 * [openqa-listener](openqa-listener) - alert if podman openqa jobs fail.
