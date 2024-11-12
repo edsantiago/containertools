@@ -21,7 +21,8 @@ Setup
 =====
 ```
 # dnf install perl-open perl-DBI perl-DBD-SQLite perl-JSON perl-libwww-perl \
-              perl-Data-TreeDumper perl-Time-Piece perl-LWP-Protocol-https
+              perl-Data-TreeDumper perl-Time-Piece perl-LWP-Protocol-https \
+              sqlite3
 ```
 
 Details
