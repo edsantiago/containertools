@@ -17,6 +17,13 @@ After running either of these, I look at the flake logs and run a
 series of `cirrus-flake-assign` commands, followed again by
 `cirrus-flake-catchup` so it regenerates the html.
 
+Setup
+=====
+```
+# dnf install perl-open perl-DBI perl-DBD-SQLite perl-JSON perl-libwww-perl \
+              perl-Data-TreeDumper perl-Time-Piece perl-LWP-Protocol-https
+```
+
 Details
 =======
 
