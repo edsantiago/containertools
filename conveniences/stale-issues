@@ -1,0 +1,193 @@
+#!/usr/bin/perl
+#
+# Script to generate a markdown table for RUN-1722
+#
+# Completely undocumented, uncommented, impenetrable. Sorry.
+#
+(our $ME = $0) =~ s|^.*/||;
+
+use v5.20;
+use utf8;
+use open qw( :encoding(UTF-8) :std );
+
+###############################################################################
+# BEGIN user-customizable section
+
+our $Base_URL = 'https://github.com/containers/podman/issues?q=is%3Aopen+is%3Aissue+sort%3Acreated-asc';
+
+our $GraphQL_URL = 'https://api.github.com/graphql';
+
+our $Repo = 'podman';
+
+# 0 for github markdown, 1 for jira markdown
+our $Jira = 1;
+$Jira = 0 if "@ARGV" =~ /github/;
+
+# END   user-customizable section
+###############################################################################
+
+
+use Time::Piece;
+use JSON;
+use LWP::UserAgent;
+use XXX;
+
+my $ymd = localtime->ymd;
+
+my @types = qw(kind/bug kind/feature flakes);
+my @ndays = qw(30 60 120);
+# FIXME: test
+#@types = qw(kind/bug);
+#@ndays = (30);
+
+my %data;
+
+for my $t (@types, "unclassified") {
+    my @type_query = ("label:$t");
+    if ($t eq 'unclassified') {
+        @type_query = (map { "-label:$_" } @types);
+    }
+
+    $data{$t}{total} = get_data(@type_query);
+
+    for my $days (@ndays, "stale") {
+        my @day_query = ("label:stale-issue");
+        if ($days ne 'stale') {
+            $day_query[0] = "-$day_query[0]";         # negate it
+
+            my $when = localtime(time - $days * 86400)->ymd;
+            push @day_query, "created:<$when";
+        }
+
+        $data{$t}{$days} = get_data(@type_query, @day_query);
+    }
+}
+
+#use Data::Dump; dd \%url;
+
+#
+# Pass 2
+#
+# Table headings
+my $bar = '|';
+$bar = '||' if $Jira;           # Jira uses '|| foo ||' for headings
+print "$bar       $bar Total $bar";
+for my $days (@ndays) {
+    print " &gt;$days days $bar";
+}
+print " stale $bar\n";
+
+# How github does titles and cell alignment
+if (!$Jira) {
+    print "| ----- | -----: |";
+    for my $days (@ndays, "stale") {
+        print  " --------: |";
+    }
+    print "\n";
+}
+
+my %sum;
+for my $t (@types, "unclassified") {
+    print "| $t |";
+    for my $days ("total", @ndays, "stale") {
+        my ($count, $url) = @{$data{$t}{$days}};
+
+        # jira wants [text|link], github wants [text](link)
+        if ($Jira) {
+            print " [$count|$url] |";
+        }
+        else {
+            print " [$count]($url) |";
+        }
+
+        $sum{$days} += $count;
+    }
+    print "\n";
+}
+
+# Final tally
+print "| Total(*): |";
+for my $days ("total", @ndays, "stale") {
+    print " ", $sum{$days}, " |";
+}
+print "|\n";
+
+print <<"END_FOO";
+
+(*) Bottom-row totals will probably not match github results, because some issues fall under multiple categories (e.g., `kind/bug` + `kind/feature`)
+END_FOO
+
+
+###############################################################################
+
+
+
+
+
+
+sub get_data {
+    my @args = @_;
+    my $url = $Base_URL;
+
+    my $count = get_count(@args);
+
+    for my $arg (@args) {
+        $arg =~ s!:!%3A!g;
+        $arg =~ s!<!%3C!g;
+        $arg =~ s!/!%2F!g;
+
+        $url .= "+$arg";
+    }
+
+    [ $count, $url ];
+}
+
+
+sub get_count {
+    my $query = sprintf(<<'END_QUERY', $Repo, join(" ", @_));
+{
+    search(query: "repo:containers/%s is:issue is:open %s", type:ISSUE) {
+      issueCount
+    }
+}
+END_QUERY
+
+    my $response = graphql_query($query);
+    return $response->{data}{search}{issueCount};
+}
+
+
+###################
+#  graphql_query  #  Send a graphql query to host, return json response
+###################
+sub graphql_query {
+    my $query = shift;
+
+
+    my $ua = LWP::UserAgent->new;
+    $ua->agent("$ME " . $ua->agent);              # Identify ourself
+
+    my %headers = (
+        'Authorization' => "bearer $ENV{GITHUB_TOKEN}",
+        'Accept'        => "application/vnd.github.antiope-preview+json",
+        'Content-Type'  => "application/json",
+    );
+    $ua->default_header($_ => $headers{$_}) for keys %headers;
+
+    # Escape quotes
+    $query =~ s/\"/\\"/g; $query =~ s/\n/ /g; $query =~ s/\s+/ /g;
+    my $postquery = qq/{ "query": "$query" }/;
+#    print $postquery; exit 0;
+
+    my $res = $ua->post($GraphQL_URL, Content => $postquery);
+    if ((my $code = $res->code) != 200) {
+        use Term::ANSIColor qw(:constants);
+        printf "%s%03d%s", ($code < 400 ? YELLOW : RED), $code, RESET;
+        use Data::Dumper; print Dumper($res);
+        exit 1;
+    }
+
+    return decode_json($res->content);
+}
+
+1;
