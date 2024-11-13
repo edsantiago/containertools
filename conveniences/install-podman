@@ -1,0 +1,81 @@
+#!/bin/bash
+#
+# Use this to build podman from source on a 1minutetip VM
+#
+
+ME=$(basename $0)
+
+host=${1?Missing HOST arg}
+
+set -e
+
+echo -n "Fedora or RHEL?  "
+redhatrelease=$(ssh root@$host cat /etc/redhat-release)
+echo " ->  $redhatrelease"
+case "$redhatrelease" in
+    Fedora*)         which=fedora;
+                     enablerepo=;
+                     bats=bats;
+                     btrfs=btrfs-progs-devel;
+                     catatonit=catatonit;
+                     ;;
+    "Red Hat Ent"*)  which=rhel;
+                     enablerepo='--enablerepo=*';
+                     bats=;
+                     btrfs=;
+                     catatonit=;
+                     ;;
+    *)               echo "$ME: WTF? $redhatrelease"; exit 1;;
+esac
+
+
+echo "dnf install build reqs"
+ssh root@$host dnf -y $enablerepo install $btrfs $catatonit \
+  composefs \
+  conmon \
+  container-selinux \
+  containers-common \
+  crun \
+  device-mapper-devel \
+  git \
+  glib2-devel \
+  glibc-devel \
+  glibc-static \
+  go \
+  golang-github-cpuguy83-md2man \
+  gpgme-devel \
+  iptables \
+  libassuan-devel \
+  libgpg-error-devel \
+  libseccomp-devel \
+  libselinux-devel \
+  make \
+  pkgconfig \
+  $bats \
+  jq \
+  nmap-ncat \
+  socat \
+  lsof \
+  httpd-tools \
+  slirp4netns \
+  zstd \
+  buildah skopeo
+
+# FIXME: do we need catatonit? It fails to install on RHEL8.8 (2023-02-02)
+
+if [[ -z "$bats" ]]; then
+    echo "install bats"
+    ssh root@$host wget https://github.com/bats-core/bats-core/archive/v1.9.0.tar.gz
+    ssh root@$host 'tar xf v1.9.0.tar.gz;cd bats-core-1.9.0;./install.sh /usr/local'
+fi
+
+echo "git clone podman"
+ssh root@$host mkdir -p /root/go
+ssh root@$host git -C /root/go clone https://github.com/containers/podman
+
+# for rootless
+if [[ $which == "fedora" ]]; then
+    ssh root@$host loginctl enable-linger fedora
+fi
+
+echo "done: $host"

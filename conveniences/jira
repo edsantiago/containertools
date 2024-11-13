@@ -1,0 +1,98 @@
+#!/bin/bash
+#
+# jira CLI - https://github.com/ankitpokhrel/jira-cli
+#
+# Nice article with sample usage:
+#    https://medium.com/@ankitpokhrel/introducing-jira-cli-the-missing-command-line-tool-for-atlassian-jira-fe44982cc1de
+#
+#------------------------------------------------------------------------------
+# First-time init:
+#
+# Get a Jira API token. (from your profile)
+#
+#    $ export JIRA_API_TOKEN=<your-jira-token>
+#    $ jira init
+#
+# If 'klist' does not show your correct Red Hat email address, you need to:
+#
+#    $ jira
+#    ~ # jira init
+#    ? Installation type: Local
+#    ? Link to Jira server: https://issues.redhat.com
+#    ? Login email: <YOUR KERBEROS ID>@redhat.com
+#    ? Default project: RUN
+#    ? Default board: RUN board
+#
+#    ✓ Configuration generated: /root/.config/.jira/.config.yml
+#
+ME=$(basename $0)
+
+# FIXME-HARDCODING! Needed for "jira mine" query
+WHOAMI='Eduardo Santiago'
+
+image="ghcr.io/ankitpokhrel/jira-cli:latest"
+
+function die() {
+    echo "$ME: $*" >&2
+    exit 1
+}
+
+if [[ -z "$JIRA_API_TOKEN" ]]; then
+    die "Please get a Jira token, and set JIRA_API_TOKEN=<value>"
+fi
+
+rootdir=$HOME/.local/share/jira-cli
+mkdir -p $rootdir/config
+
+# If called with pull
+if [[ "$*" = "pull" ]]; then
+    podman --root    $rootdir/containers/root               \
+           --runroot $rootdir/containers/runroot            \
+           pull $image
+    exit 0
+fi
+
+# If called with args
+entrypoint=
+plain=
+if [[ -n "$*" ]]; then
+    entrypoint="--entrypoint /bin/jira"
+
+    # Special case for init: let's be kind to our users
+    if [[ "$*" = "init" ]]; then
+        dashlogin=
+        whoami=$(klist -l | awk '{print $1}' | tr A-Z a-z | grep @redhat)
+        if [[ -n "$whoami" ]]; then
+            dashlogin="--login $whoami"
+        fi
+        set -- \
+            init \
+            --installation local \
+            --server https://issues.redhat.com \
+            $dashlogin \
+            --project "RUN" \
+            --board "RUN board"
+    elif [[ "$*" = "mine" ]]; then
+        set -- issue list -a"$WHOAMI" -q 'status not in (Done,Closed)'
+    fi
+
+    # Issues: if called with redirection or pipe, don't use TUI
+    if ! [[ -t 1 ]]; then
+        if [[ "$*" =~ issue ]]; then
+            plain=--plain
+        fi
+    fi
+fi
+
+# Separate graph and run roots because podman tests wipe out image cache
+podman --root    $rootdir/containers/root               \
+       --runroot $rootdir/containers/runroot            \
+       run                                              \
+       -v        $rootdir/config:/root/.config/.jira:Z  \
+       -e        JIRA_API_TOKEN                         \
+       -e        JIRA_AUTH_TYPE=bearer                  \
+       -e        PAGER='less -R'                        \
+       -e        TERM                                   \
+       --rm -it                                         \
+       $entrypoint                                      \
+       $image "$@" $plain

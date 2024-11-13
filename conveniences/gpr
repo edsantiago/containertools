@@ -1,0 +1,148 @@
+#!/bin/bash
+#
+# gpr - check out a git pr, preserving prior checkouts if applicable
+#
+ME=$(basename $0)
+
+red="\e[38;5;196m"
+green="\e[38;5;46m"
+reset="\e[m"
+
+missing=" argument is missing; see $ME --help for details"
+usage="Usage: $ME [--help] [-n | --dry-run] PR
+
+$ME is a friendly, hand-holding front end for 'git pr'.
+Feed me a github PR, and I will pull it. My added value is:
+
+  * I will refuse to run if your working directory is dirty
+
+  * If you have a previously checked-out copy of that PR, I will:
+    - preserve it as '-revNN'
+    - show you instructions on how to diff against that revision.
+
+Requirements:
+  1) git-extras, for 'git pr'. This lives in standard Fedora repos.
+  2) gh (github cli), from https://cli.github.com/
+
+OPTIONS:
+
+  -n | --dry-run   don't run any commands, just show them
+  --help           display usage message
+"
+
+die() {
+    echo "$ME: $*" >&2
+    exit 1
+}
+
+verbose=
+NOT=
+for i
+do
+    value=`expr "$i" : '[^=]*=\(.*\)'`
+    case "$i" in
+    -h*|--help)	echo "$usage"; exit 0;;
+    -n|--dry-run) NOT=' [NOT!]'; shift ;;
+    -v|--verbose) verbose=1; shift;;
+    -*)	echo "$ME: unrecognized option $i" >&2
+	echo "$usage" >&2
+	exit 1;;
+    *)	break;;
+    esac
+done
+
+
+PR=${1?PR$missing}
+
+test -d .git || die "No .git subdirectory"
+
+#
+# Clean branches for merged/closed PRs
+#
+if [[ $PR = "clean" ]]; then
+    # Can only run from main
+    current_branch=$(git rev-parse --abbrev-ref=strict HEAD)
+    if [[ $current_branch != "main" ]]; then
+        die "Please run me from main (current branch: $current_branch)"
+    fi
+
+    # Color to use for displaying git commands
+    action="\e[37m"
+    if [[ -n "$NOT" ]]; then
+        action=""
+    fi
+
+    previous_branch=
+    while read branch; do
+        if [[ $branch =~ -rev ]]; then
+            if [[ ${branch%-*} = $previous_branch ]]; then
+                echo -e " >> ${action}git branch -D \e[33mpr/$branch$NOT$reset"
+                if [[ -z "$NOT" ]]; then
+                    git branch -D pr/$branch
+                fi
+            elif [[ -n "$verbose" ]]; then
+                echo " [ preserving: $branch ]"
+            fi
+        else
+            pr_info=$(gh pr view $branch)
+            title=$(sed -ne 's/^title:\s\+//p' <<<"$pr_info")
+            state=$(sed -ne 's/^state:\s\+//p' <<<"$pr_info")
+
+            if [[ $state = "CLOSED" || $state = "MERGED" ]]; then
+                printf "%5s ${red}%-6s${reset} %s\n" $branch $state "$title"
+                echo -e " >  ${action}git branch -D \e[33mpr/$branch$NOT$reset"
+                if [[ -z "$NOT" ]]; then
+                    git branch -D pr/$branch
+                fi
+                previous_branch=$branch
+            elif [[ $state != "OPEN" ]]; then
+                printf "%5s %-6s %s\n" $branch $state "$title"
+            else
+                printf "%5s ${green}%-6s${reset} %s\n" $branch $state "$title"
+            fi
+        fi
+    done < <(git branch --list --format '%(refname:short)' | sed -ne 's;^pr/;;p')
+    exit 0
+fi
+
+# Default case: called with an actual PR.
+#
+# Abort if there are modified files
+modified=$(git status --porcelain --untracked-files=no)
+if [[ -n "$modified" ]]; then
+    echo "$modified"
+    echo
+    die "This only works on clean directories"
+fi
+
+newrev=1
+latest_backup=
+while read branch; do
+    rev=$(expr "$branch" : ".*-rev0*\([0-9]\+\)" 2>/dev/null)
+    if [[ -n "$rev" ]]; then
+        # Keep existing -revXX branches as they are, but keep track of
+        # the highest local iteration, so we can rename our current
+        # branch to that-plus-one.
+        if (( rev >= newrev )); then
+            newrev=$((rev + 1))
+        fi
+    else
+        latest_backup="pr/$PR-rev$(printf %02d $newrev)"
+        cmd="git branch -m $branch $latest_backup"
+        echo $cmd$NOT
+        if [[ -z "$NOT" ]]; then
+            $cmd
+        fi
+    fi
+done < <(git branch --format '%(refname:short)'| grep pr/$PR | tac)
+
+cmd="git pr $PR upstream"
+echo $cmd$NOT
+if [[ -z "$NOT" ]]; then
+    $cmd
+
+    # FIXME: nope, this doesn't work; we need to track all 'branch -m's
+    if [[ -n $latest_backup ]]; then
+        echo "  git range-diff --creation-factor=50 ${latest_backup}...pr/$PR"
+    fi
+fi

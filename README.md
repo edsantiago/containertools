@@ -41,3 +41,8 @@ results in my morning email:
 This one is a systemd unit, not cron, but same idea, it runs unattended:
 
 * [openqa-listener](openqa-listener) - alert if podman openqa jobs fail.
+
+[Conveniences](conveniences/)
+============
+
+Hodgepodge of little tools that make my life easier.
