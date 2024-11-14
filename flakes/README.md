@@ -106,6 +106,14 @@ can look for patterns. If they merit filing an issue, and
 they usually do, I use `cirrus-flake-xref --markdown --filter=99999`
 and include the output when filing the issue.
 
+Once you've filed the issue, update the DB:
+```
+$ sqlite3 ~/.local/share/cirrus-flake-summarize/podman/db.sqlite
+SQLite version 3.45.1 2024-01-30 16:01:20
+Enter ".help" for usage hints.
+sqlite> UPDATE flakes SET flake='24571' WHERE flake='99999';
+```
+
 [cirrus-flake-grep](cirrus-flake-grep)
 -----------------
 
