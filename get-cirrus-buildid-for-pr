@@ -105,7 +105,7 @@ sub main {
 sub doit {
     my $pr = shift;
 
-    $pr =~ /^(\d{3,6})$/
+    $pr =~ /^(\d{2,6})$/
         or die "$ME: Invalid PR '$pr', must be 3-6 digits\n";
 
     exists $ENV{GITHUB_TOKEN}
@@ -130,6 +130,7 @@ sub get_one_task_id {
     $checkName = 'Total Success' if $Project eq 'skopeo';
     $checkName = 'Total success' if $Project eq 'netavark';
     $checkName = 'Total success' if $Project eq 'aardvark-dns';
+    $checkName = 'Total Success' if $Project eq 'podman-machine-os';
 
     my $query = sprintf(<<'END_QUERY', $Project, $pr, $cirrus_app_id, $checkName);
 {
