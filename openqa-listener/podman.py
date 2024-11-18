@@ -75,7 +75,7 @@ class SaveMessage:
             if "run" in message.body:
                 url = message.body["run"]["url"]
             else:
-                url = "https://openqa.fedoraproject.org/tests/" + message.body["id"]
+                url = "https://openqa.fedoraproject.org/tests/" + str(message.body["id"])
 
             email.set_content(queue + "\n\n" + url + "\n\n" + str(message))
 
