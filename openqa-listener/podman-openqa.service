@@ -5,7 +5,7 @@ Description=podman OpenQA fedmsg listener
 
 [Service]
 Type=simple
-WorkingDirectory=/home/REPLACEME/.config/fedora-messaging
+WorkingDirectory=%h/.config/fedora-messaging
 Environment=PYTHONPATH=.
 ExecStart=fedora-messaging --conf podman.toml consume
 Restart=always
