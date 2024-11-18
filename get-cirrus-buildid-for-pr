@@ -106,7 +106,7 @@ sub doit {
     my $pr = shift;
 
     $pr =~ /^(\d{2,6})$/
-        or die "$ME: Invalid PR '$pr', must be 3-6 digits\n";
+        or die "$ME: Invalid PR '$pr', must be 2-6 digits\n";
 
     exists $ENV{GITHUB_TOKEN}
         or die "$ME: \$GITHUB_TOKEN undefined\n";
