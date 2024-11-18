@@ -56,6 +56,59 @@ Monitoring
 You can check that it's working by looking in /var/tmp/fedmsg-podman
 or whatever you set "path" to. Messages come in every few minutes.
 
+Persistent Queues
+=================
+
+That is: being able to connect, then disconnect overnight or while
+taking your laptop somewhere, then reconnect and pick up messages
+from the gap.
+
+As of 2024-11-18 I have been unable to get this to work. Should you
+wish to pick up where I left off, here's my methodology:
+
+* two directories, `~/.config/fedora-messaging` and `-orig`
+* diffs:
+```
+-#[queues.00000000-0000-0000-0000-000000000000]
+-#durable = true
+-#auto_delete = false
+-#exclusive = true
+-#arguments = {}
++[queues.output-from-uuidgen]
++durable = true
++auto_delete = false
++exclusive = true
++arguments = {}
+
+ # If you use the server-generated queue names, you can leave out the "queue"
+ # parameter in the bindings definition.
+ [[bindings]]
+-#queue = "00000000-0000-0000-0000-000000000000"
++queue = "output-from-uuidgen-same-as-above"
+ exchange = "amq.topic"
+.....
+[consumer_config]
+ example_key = "for my consumer"
+-path = "/var/tmp/fedmsg-podman-orig/fedmsg-podman.log"
++path = "/var/tmp/fedmsg-podman/fedmsg-podman.log"
+```
+python diff:
+```
+             raise "FIXME I don't know what this is"
+
++        with open(self.path, "a") as fd:
++            fd.write(ts + " " + which_test + " " + result + "\n")
++
+         if "podman" not in which_test:
+```
+* Run both services. You may want to `journalctl -f` both, in separate terms.
+* Stop `fedmsg-podman` (the one with the uuid). Don't touch `-orig`.
+* As messages come in to `-orig` (which you'll see with your journalctl),
+periodically start `fedmsg-podman`.
+* If you see it pick up where it left off, groovy! What I see, though,
+is that it just starts receiving new messages. Missing ones never show up.
+
+
 Useful links
 ============
 
