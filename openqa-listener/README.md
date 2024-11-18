@@ -31,7 +31,24 @@ contain a link at the top, click on that to see openqa results.
 (Note: sometimes the failure is in `_advisory_update`. You can
 probably ignore those, they usually indicate an infrastructure
 problem or a problem with the package itself. Errors in `podman`,
-you need to look at).
+you need to look at. As of 2024-11-18 the fedmsg structure does
+not include an indication of where the failure occurred. Adam
+Williamson is aware of this gap, his response on 2024-08-29 is:
+
+>Subject: Re: Request: OpenQA message bus: new field, where did it fail?
+>
+>Hey, Ed. It should be possible, I'm not sure how much work it'll be - I
+>may need to do something upstream. It'd more likely be added to the
+>openqa.job.done message than the ci.fedora-update.test.complete message
+>- the format of CI messages is standardized in
+>https://pagure.io/fedora-ci/messages , it's easier for me to tweak the
+>openqa-specific messages. The openqa.* messages are more or less direct
+>conversions of events in openQA's internal event system, the CI
+>messages are transformed from those. I'll try and look into it when I
+>get a minute.
+
+
+).
 
 Monitoring
 ==========
