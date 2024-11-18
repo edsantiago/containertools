@@ -108,6 +108,8 @@ periodically start `fedmsg-podman`.
 * If you see it pick up where it left off, groovy! What I see, though,
 is that it just starts receiving new messages. Missing ones never show up.
 
+I've tried `exclusive = false` as well as `true`. Haven't tried `durable=false`.
+At this point I'm in diminishing returns. Good luck with your explorations.
 
 Useful links
 ============
