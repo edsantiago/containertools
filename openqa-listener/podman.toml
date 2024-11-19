@@ -52,9 +52,15 @@ exchange = "amq.topic"
 routing_keys = [
     "org.fedoraproject.prod.ci.fedora-update.test.complete",
     "org.fedoraproject.stg.ci.fedora-update.test.complete",
-    "org.fedoraproject.stg.resultsdb.result.new",
-    "org.fedoraproject.prod.openqa.job.done"
+    "org.fedoraproject.stg.resultsdb.result.new"
 ]
+# FIXME: OPTIONAL: include "org.fedoraproject.prod.openqa.job.done"
+# ...but only if you want lots of extra unnecessary emails.
+# The goal behind this was to see if we could find a message
+# that included _where_ in the test pipeline a failure occurred,
+# so that we can ignore the common "_advisory_post" false alarms.
+# As of 2024-11-19 this queue just generates a lot of "incomplete"
+# and "parallel_failed" messages that don't seem helpful.
 
 [consumer_config]
 example_key = "for my consumer"
