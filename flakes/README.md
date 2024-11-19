@@ -59,6 +59,22 @@ cirrus-flake-summarize: Warning: No annotated log: https://api.cirrus-ci.com/v1/
 First line is the test name. Next few lines are links to logs. Final line
 is a flake ID (in my flake database) suitable for `cirrus-flake-assign`.
 
+WHEN TO RUN IT MANUALLY
+
+You're watching a PR; maybe yours, maybe someone else's. PR is still
+in review. You notice a test failure, and realize it's a flake. No
+other tests fail, or maybe 1-2 other flakes. No real test failures.
+But you don't know if the PR is going to be approved and merged, or
+re-pushed for other reasons. If the PR is re-pushed, you lose this
+flake history, and that matters because this particular flake
+instance (root/rootless, local/remote, fedora 48/49) might
+possibly add useful data to the flake catalog.
+
+In this case, run `cirrus-flake-summarize PR-NUMBER`. Even if the
+PR isn't merged. Even if you haven't re-run the flakes. This adds
+the flake to the catalog, and you can review it later. (There is
+no danger of dups. Flakes are keyed by Cirrus TaskID, which is
+unique).
 
 [cirrus-flake-xref](cirrus-flake-xref)
 -----------------
