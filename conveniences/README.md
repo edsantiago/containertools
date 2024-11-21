@@ -1,6 +1,13 @@
 These are independent one-off tools. Maybe you'll find one or more
 of them helpful.
 
+### [find-obsolete-skips](find-obsolete-skips) - look for no-longer-relevant test skips
+
+Once every few months, a bug gets fixed for which we've
+disabled a test. This script uses (fragile) heuristics
+to look for Skip messages with an issue in the comments,
+then queries github to see if issue is still open.
+
 ### [gpr](gpr) - git pr checkout
 
 Sweet front end to `git pr` (in the `git-extras` rpm). Best feature
