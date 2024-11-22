@@ -136,7 +136,8 @@ sub doit {
                 my $branch = $job->{branch};
 
                 # Don't print yet. Gather output into a string, so we can trim trailing whitespace.
-                my $outstring = sprintf("   %-20s %-20s", $branch, $job->{expression});
+                (my $on_cirrus = $job->{expression}) =~ s/^\s+|\s+$//g;
+                my $outstring = sprintf("   %-20s %-20s", $branch, $on_cirrus);
                 # For readability: right-align and pad single digits
                 while ($outstring =~ s/(\d)\s(\d)\s/$1  $2 /) { }
                 my $name = $job->{name};
@@ -144,7 +145,8 @@ sub doit {
                 # FIXME: here is where we could crossref against spreadsheet
                 if ($jobs_wanted) {
                     if (my $expect = $jobs_wanted->{$branch}) {
-                        if ($job->{expression} ne $expect) {
+                        $expect =~ s/^\s+|\s+$//g;              # trim trailing whitespace
+                        if ($on_cirrus ne $expect) {
                             $outstring .= " [ DESIRED: $expect ]";
                         }
 
